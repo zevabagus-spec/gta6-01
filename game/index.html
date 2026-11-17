@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>Solara Bay — The Solara Job</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b1626; font-family: "Segoe UI", Arial, sans-serif; }
+  #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  #hud { position: fixed; inset: 0; pointer-events: none; color: #fff; text-shadow: 0 1px 3px rgba(0,0,0,.8); display: none; z-index: 5; }
+  #hud.on { display: block; }
+  #minimap { position: absolute; left: 14px; bottom: 14px; width: 170px; height: 170px; border: 2px solid rgba(255,255,255,.55); border-radius: 50%; background: rgba(8,20,36,.85); }
+  #vitals { position: absolute; left: 196px; bottom: 18px; width: 210px; }
+  .bar { height: 12px; background: rgba(0,0,0,.55); border: 1px solid rgba(255,255,255,.6); margin: 4px 0; }
+  .bar > div { height: 100%; }
+  #health-fill { background: #37d67a; width: 100%; }
+  #armour-fill { background: #4aa8ff; width: 0%; }
+  .bar-label { font-size: 11px; letter-spacing: 1px; }
+  #top-right { position: absolute; right: 16px; top: 12px; text-align: right; font-weight: 700; }
+  #cash { font-size: 26px; color: #7dff9e; }
+  #stars { font-size: 26px; letter-spacing: 4px; color: #ffd23e; margin-top: 2px; }
+  #clock { font-size: 16px; margin-top: 2px; }
+  #objective { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); text-align: center; max-width: 560px; }
+  #objective-title { font-size: 19px; font-weight: 800; color: #ffe08a; }
+  #objective-text { font-size: 14px; }
+  #bottom-right { position: absolute; right: 16px; bottom: 16px; text-align: right; }
+  #ammo { font-size: 22px; font-weight: 700; }
+  #weapon { font-size: 13px; color: #ffd23e; }
+  #speed { font-size: 34px; font-weight: 800; }
+  #speed-unit { font-size: 12px; }
+  #toast { position: absolute; left: 50%; bottom: 120px; transform: translateX(-50%); font-size: 20px; font-weight: 700; color: #ffe08a; text-align: center; }
+  #crosshair { position: absolute; left: 50%; top: 50%; width: 14px; height: 14px; margin: -7px 0 0 -7px; display: none; }
+  #crosshair::before, #crosshair::after { content: ""; position: absolute; background: #fff; }
+  #crosshair::before { left: 6px; top: 0; width: 2px; height: 14px; }
+  #crosshair::after { top: 6px; left: 0; width: 14px; height: 2px; }
+  #interact { position: absolute; left: 50%; top: 58%; transform: translateX(-50%); font-size: 16px; font-weight: 700; background: rgba(0,0,0,.6); padding: 6px 12px; border-radius: 4px; display: none; }
+  .screen { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; flex-direction: column; text-align: center; color: #fff; z-index: 10; background: radial-gradient(ellipse at 50% 30%, rgba(255,120,60,.55), rgba(8,16,34,.92) 70%); }
+  .screen.on { display: flex; }
+  .screen h1 { font-size: 64px; margin: 0; letter-spacing: 6px; color: #ffd23e; text-shadow: 0 4px 0 #c33, 0 8px 24px rgba(0,0,0,.7); }
+  .screen h2 { font-size: 22px; margin: 8px 0 4px; color: #7dffd4; letter-spacing: 3px; }
+  .screen p { max-width: 560px; line-height: 1.5; }
+  .screen .btn { pointer-events: auto; cursor: pointer; margin: 8px; padding: 12px 28px; font-size: 17px; font-weight: 700; color: #10202f; background: #ffd23e; border: none; border-radius: 6px; }
+  .screen .btn:hover { background: #ffe08a; }
+  .screen .btn.ghost { background: rgba(255,255,255,.15); color: #fff; border: 1px solid #fff; }
+  .controls { font-size: 13px; color: #cfe3ff; background: rgba(0,0,0,.35); padding: 10px 16px; border-radius: 8px; margin-top: 10px; }
+  #fallback { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; color: #fff; background: #0b1626; z-index: 20; text-align: center; padding: 20px; }
+  #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Solara Bay: an open-world crime game. Drive and walk around the city, take jobs from Mara Quinn, and pull off the Solara Job."></canvas>
+<div id="hud">
+  <canvas id="minimap" width="170" height="170"></canvas>
+  <div id="vitals">
+    <div class="bar-label">HEALTH</div><div class="bar"><div id="health-fill"></div></div>
+    <div class="bar-label">ARMOUR</div><div class="bar"><div id="armour-fill"></div></div>
+  </div>
+  <div id="top-right"><div id="cash">$250</div><div id="stars"></div><div id="clock">09:00</div></div>
+  <div id="objective"><div id="objective-title">SOLARA BAY</div><div id="objective-text">Press ENTER to start</div></div>
+  <div id="bottom-right"><div id="weapon">FISTS</div><div id="ammo"></div><div id="speed">0</div><div id="speed-unit">MPH</div></div>
+  <div id="toast"></div>
+  <div id="crosshair"></div>
+  <div id="interact">Press E</div>
+</div>
+<div class="screen on" id="screen-title">
+  <h1>SOLARA BAY</h1>
+  <h2>THE SOLARA JOB</h2>
+  <p>You are <b>Dario Voss</b>, a courier with a fast car and faster debts. Fixer <b>Mara Quinn</b> has six jobs for you — pickups, a stolen Sunray, taxi fares, a rival crew, a hot escape, and the Marina heist. Survive the Solara Bay police and get paid.</p>
+  <div><button class="btn" id="btn-start">Start New Game</button><button class="btn ghost" id="btn-continue" style="display:none">Continue</button></div>
+  <div class="controls">WASD move &nbsp;·&nbsp; Shift run &nbsp;·&nbsp; Mouse drag camera &nbsp;·&nbsp; F punch &nbsp;·&nbsp; Click shoot &nbsp;·&nbsp; 1/2 fists / pistol &nbsp;·&nbsp; E interact / enter car &nbsp;·&nbsp; Space handbrake &nbsp;·&nbsp; C camera &nbsp;·&nbsp; P pause &nbsp;·&nbsp; M mute</div>
+  <p style="font-size:12px;color:#9fb6d8">An original game. Not affiliated with Rockstar Games or any commercial game.</p>
+</div>
+<div class="screen" id="screen-pause">
+  <h1>PAUSED</h1>
+  <p>Solara Bay waits for no one — except right now.</p>
+  <div><button class="btn" id="btn-resume">Resume</button><button class="btn ghost" id="btn-quit-title">Quit to Title</button></div>
+</div>
+<div class="screen" id="screen-busted">
+  <h1>BUSTED</h1>
+  <p>The Solara Bay police caught you. Bail cost you $100 and the heat is off — for now.</p>
+  <div><button class="btn" id="btn-busted">Back on the Street</button></div>
+</div>
+<div class="screen" id="screen-wasted">
+  <h1>WASTED</h1>
+  <p>Dario went down. The clinic patched him up for $150 — Mara still expects her jobs done.</p>
+  <div><button class="btn" id="btn-wasted">Get Up</button></div>
+</div>
+<div class="screen" id="screen-complete">
+  <h1>THE SOLARA JOB</h1>
+  <h2>COMPLETE</h2>
+  <p id="complete-text">The Marina heist is done. Dario Voss walks away clean — richer, and still free.</p>
+  <div><button class="btn" id="btn-again">Free Roam</button></div>
+</div>
+<div id="fallback"><div><h1>WebGL is unavailable</h1><p>Solara Bay needs WebGL to render its 3D city. Please enable hardware acceleration or try desktop Chrome, then reload this page.</p></div></div>
+<p id="status" role="status" aria-live="polite"></p>
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>
