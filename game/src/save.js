@@ -1,79 +1,66 @@
-// Solara Bay — saving. Progress (mission, cash, coins, health, armour,
-// ammo, clock) goes to localStorage, autosaved every 15 seconds and on
-// mission completion. If storage is unavailable or the saved data is corrupt,
-// the game falls back to a session-only save and keeps playing.
-import { CFG, MISSIONS } from './config.js';
+// Save / load with a session fallback: if localStorage is blocked or
+// the stored JSON is corrupt, the game keeps playing with an
+// in-memory save instead of crashing or losing the session.
 
-export class SaveGame {
-  constructor() {
-    this.available = true;
-    this.sessionOnly = null;
-    try {
-      const probe = '__solara_probe__';
-      localStorage.setItem(probe, '1');
-      localStorage.removeItem(probe);
-    } catch {
-      this.available = false;
-    }
+import { SAVE_KEY } from './config.js';
+
+let memorySave = null;
+let storageWorks = null;
+
+function storageAvailable() {
+  if (storageWorks !== null) return storageWorks;
+  try {
+    const probe = '__solara_probe__';
+    window.localStorage.setItem(probe, '1');
+    window.localStorage.removeItem(probe);
+    storageWorks = true;
+  } catch (err) {
+    storageWorks = false;
   }
+  return storageWorks;
+}
 
-  save(world) {
-    const data = {
-      version: 1,
-      missionIndex: Math.min(world.missions.index, MISSIONS.length - 1),
-      cash: world.cash,
-      coins: world.city.coins.filter((c) => c.taken).map((c) => `${c.x},${c.z}`),
-      health: world.player.health,
-      armour: world.player.armour,
-      ammo: world.player.ammo,
-      clockMinutes: world.clockMinutes,
-      savedAt: Date.now(),
-    };
-    if (this.available) {
-      try { localStorage.setItem(CFG.saveKey, JSON.stringify(data)); return true; }
-      catch { this.available = false; }
-    }
-    this.sessionOnly = data;
+export function saveGame(data) {
+  const payload = { version: 1, savedAt: Date.now(), ...data };
+  memorySave = payload;
+  if (!storageAvailable()) return false;
+  try {
+    window.localStorage.setItem(SAVE_KEY, JSON.stringify(payload));
+    return true;
+  } catch (err) {
     return false;
-  }
-
-  load() {
-    let raw = null;
-    if (this.available) {
-      try { raw = localStorage.getItem(CFG.saveKey); } catch { raw = null; }
-    } else if (this.sessionOnly) {
-      return this.sessionOnly;
-    }
-    if (!raw) return null;
-    try {
-      const data = JSON.parse(raw);
-      if (!data || data.version !== 1 || typeof data.missionIndex !== 'number') return null;
-      if (data.missionIndex < 0 || data.missionIndex >= MISSIONS.length) return null;
-      return data;
-    } catch {
-      return null; // corrupt save: start fresh rather than crash
-    }
-  }
-
-  hasSave() { return this.load() !== null; }
-
-  clear() {
-    this.sessionOnly = null;
-    if (this.available) { try { localStorage.removeItem(CFG.saveKey); } catch { /* ignore */ } }
   }
 }
 
-// Apply a loaded save to a fresh world. Coins taken stay taken; the player
-// restarts at the Downtown plaza at the start of the saved mission.
-export function applySave(world, data) {
-  world.missions.index = data.missionIndex;
-  world.missions.step = 0;
-  world.cash = data.cash;
-  world.player.health = data.health ?? 100;
-  world.player.armour = data.armour ?? 0;
-  world.player.ammo = data.ammo ?? CFG.pistolAmmo;
-  world.clockMinutes = data.clockMinutes ?? 540;
-  const taken = new Set(data.coins || []);
-  for (const coin of world.city.coins) coin.taken = taken.has(`${coin.x},${coin.z}`);
-  world.player.x = -40; world.player.z = 60;
+export function loadGame() {
+  if (storageAvailable()) {
+    try {
+      const raw = window.localStorage.getItem(SAVE_KEY);
+      if (!raw) return memorySave;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object' || parsed.version !== 1) return null;
+      memorySave = parsed;
+      return parsed;
+    } catch (err) {
+      return memorySave;
+    }
+  }
+  return memorySave;
+}
+
+export function hasSave() {
+  return loadGame() !== null && loadGame() !== undefined;
+}
+
+export function clearSave() {
+  memorySave = null;
+  if (storageAvailable()) {
+    try { window.localStorage.removeItem(SAVE_KEY); } catch (err) { /* ignore */ }
+  }
+}
+
+export function describeSave(save) {
+  if (!save) return '';
+  const mission = Math.min(6, (save.missionIndex || 0) + 1);
+  return `Saved game: mission ${mission} of 6, $${save.cash || 0}`;
 }

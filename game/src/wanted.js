@@ -1,94 +1,96 @@
-// Solara Bay — the wanted system. Crimes raise the level from 0 to 5; the
-// level decays when the player lies low, but a mission can lock it (escape
-// missions). Police cars spawn up to the level's count and on-foot cops join
-// at level 3. Spawns happen on streets near the player, never on top of them.
-import { CFG } from './config.js';
-import { mulberry32, dist2 } from './math3d.js';
+// The wanted system: stars 0-5, police cars and foot officers scaled
+// to the level, decay after a quiet spell, and a locked escape mode
+// for the Heat Wave mission where decay only happens at the hideout.
+
+import { WANTED_DECAY_SECONDS } from './config.js';
 import { makeCar } from './vehicles.js';
+import { spawnCop } from './pedestrians.js';
+import { dist2D } from './math3d.js';
 
-export function createWanted() {
-  return { level: 0, locked: 0, decayTimer: 0, crimeTimer: 0 };
+export function policeCarTarget(wanted) {
+  return Math.min(5, Math.max(0, wanted));
 }
 
-export function addWanted(world, amount, reason) {
-  const w = world.wanted;
-  if (w.locked > 0) return;
-  w.level = Math.min(5, w.level + amount);
-  w.decayTimer = CFG.wantedDecaySeconds;
-  w.crimeTimer = 3;
-  if (w.level > 0) world.toast(`Wanted level ${w.level} — ${reason}`, 2.5);
+export function footCopTarget(wanted) {
+  if (wanted >= 4) return 3;
+  if (wanted >= 2) return 2;
+  if (wanted >= 1) return 1;
+  return 0;
 }
 
-// Decay one star at a time while the player commits no crime and no police
-// car is close.
-export function updateWanted(world, dt, policeCars) {
-  const w = world.wanted;
-  if (w.locked > 0) { w.level = w.locked; return; }
-  w.crimeTimer = Math.max(0, w.crimeTimer - dt);
-  if (w.level === 0) return;
-  let near = false;
-  for (const car of policeCars) {
-    if (dist2(car.x, car.z, world.player.x, world.player.z) < 45) { near = true; break; }
+export function addWanted(G, amount, reason) {
+  if (G.wantedLocked) return;
+  const before = G.wanted;
+  G.wanted = Math.min(5, G.wanted + amount);
+  G.lastCrimeAt = G.time;
+  if (G.wanted > before) {
+    G.toast(`Wanted level ${G.wanted} — ${reason}`);
+    G.sounds.sirenBlip();
   }
-  if (w.crimeTimer <= 0 && !near) {
-    w.decayTimer -= dt;
-    if (w.decayTimer <= 0) {
-      w.level -= 1;
-      w.decayTimer = CFG.wantedDecaySeconds;
-      if (w.level === 0) world.toast('You lost the Bay Patrol.', 2.5);
-    }
-  } else {
-    w.decayTimer = CFG.wantedDecaySeconds;
-  }
+  syncPolice(G);
 }
 
-// Keep the right number of police cars and cops alive for the current level.
-export function syncPolice(world, rng) {
-  const level = world.wanted.level;
-  const wantCars = level === 0 ? 0 : Math.min(CFG.maxPoliceCars, level === 5 ? 4 : level + (level >= 4 ? 1 : 0));
-  while (world.policeCars.length < wantCars) {
-    world.policeCars.push(spawnPoliceCar(world, rng));
-  }
-  while (world.policeCars.length > wantCars) {
-    const car = world.policeCars.pop();
-    const i = world.cars.indexOf(car);
-    if (i >= 0) world.cars.splice(i, 1);
-  }
-  const wantCops = level >= 3 ? Math.min(CFG.maxCops, level - 2) : 0;
-  while (world.cops.length < wantCops) world.cops.push(spawnCop(world, rng));
-  while (world.cops.length > wantCops) world.cops.pop();
+export function setWanted(G, level, locked) {
+  G.wanted = Math.max(0, Math.min(5, level));
+  G.wantedLocked = !!locked;
+  G.lastCrimeAt = G.time;
+  syncPolice(G);
 }
 
-function streetSpotNear(world, rng, minD, maxD) {
-  for (let tries = 0; tries < 12; tries++) {
-    const ang = rng() * Math.PI * 2;
-    const d = minD + rng() * (maxD - minD);
-    const x = world.player.x + Math.cos(ang) * d;
-    const z = world.player.z + Math.sin(ang) * d;
-    if (Math.abs(x) > CFG.worldHalf - 10 || Math.abs(z) > CFG.worldHalf - 10) continue;
-    // Snap onto the nearest street so police appear on roads, not in blocks.
-    const sx = Math.round(x / 40) * 40;
-    const sz = Math.round(z / 40) * 40;
-    const useX = Math.abs(x - sx) < Math.abs(z - sz);
-    return useX ? [sx, z] : [x, sz];
+export function clearWanted(G) {
+  G.wanted = 0;
+  G.wantedLocked = false;
+  syncPolice(G);
+  G.sounds.setSiren(false);
+}
+
+export function syncPolice(G) {
+  const p = G.player;
+  // Police cars: spawn ahead of the player on the road grid, despawn extras.
+  const cars = G.cars.filter((c) => c.kind === 'police');
+  const want = policeCarTarget(G.wanted);
+  while (cars.length < want) {
+    const angle = Math.random() * Math.PI * 2;
+    const car = makeCar('police', p.x + Math.sin(angle) * 55, p.z + Math.cos(angle) * 55, angle, [0.1, 0.15, 0.35]);
+    G.cars.push(car);
+    cars.push(car);
   }
-  return [world.player.x + 60, world.player.z];
+  while (cars.length > want) {
+    const car = cars.pop();
+    const idx = G.cars.indexOf(car);
+    if (idx >= 0) G.cars.splice(idx, 1);
+  }
+  // Foot officers spawn near the player, never on top of them.
+  const cops = G.cops.filter((c) => c.health > 0);
+  const wantCops = footCopTarget(G.wanted);
+  while (cops.length < wantCops) {
+    const angle = Math.random() * Math.PI * 2;
+    const cop = spawnCop(G, p.x + Math.sin(angle) * 26, p.z + Math.cos(angle) * 26);
+    G.cops.push(cop);
+    cops.push(cop);
+  }
+  if (G.cops.length > wantCops) {
+    G.cops = G.cops.filter((c) => c.health <= 0).concat(G.cops.filter((c) => c.health > 0).slice(0, wantCops));
+  }
+  G.sounds.setSiren(G.wanted > 0);
 }
 
-function spawnPoliceCar(world, rng) {
-  const [x, z] = streetSpotNear(world, rng, 55, 85);
-  const car = makeCar('police' + world.policeCars.length + Date.now() % 1000, 'police', x, z, 0);
-  car.speed = 12;
-  world.cars.push(car);
-  return car;
+export function updateWanted(G, dt) {
+  if (G.wanted <= 0) return;
+  // Locked (mission escape): only the hideout clears the heat.
+  if (G.wantedLocked) return;
+  const quietFor = G.time - G.lastCrimeAt;
+  const nearestCop = Math.min(
+    ...G.cops.filter((c) => c.health > 0).map((c) => dist2D(c.x, c.z, G.player.x, G.player.z)),
+    ...G.cars.filter((c) => c.kind === 'police').map((c) => dist2D(c.x, c.z, G.player.x, G.player.z)),
+    999,
+  );
+  // Heat fades after a quiet spell out of sight of the patrols.
+  if (quietFor > WANTED_DECAY_SECONDS && nearestCop > 30) {
+    G.wanted -= 1;
+    G.lastCrimeAt = G.time;
+    G.toast(G.wanted === 0 ? 'You lost the cops!' : `Heat cooling — wanted level ${G.wanted}`);
+    syncPolice(G);
+    if (G.wanted === 0) G.sounds.setSiren(false);
+  }
 }
-
-function spawnCop(world, rng) {
-  const [x, z] = streetSpotNear(world, rng, 25, 45);
-  return {
-    id: 'cop' + world.cops.length + Date.now() % 1000, x, z,
-    yaw: 0, health: 100, meshKey: 'cop', kind: 'cop',
-    shootTimer: 1, bustTimer: 0, speed: 0,
-  };
-}
-export { mulberry32 };

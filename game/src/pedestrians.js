@@ -1,153 +1,198 @@
-// Solara Bay — pedestrians, rivals and on-foot police. Pedestrians wander
-// the sidewalks and flee from gunfire or a speeding car; Harbor rivals (mission
-// 4) hunt the player and shoot; on-foot cops (wanted 3+) chase the player,
-// shoot at range, and bust them on touch.
-import { CFG } from './config.js';
-import { mulberry32, clamp, angleLerp, dist2 } from './math3d.js';
-import { newTriList, pushBox } from './engine.js';
-import { collideCircleBox } from './city.js';
+// People on the street: wandering pedestrians, the Rust Vipers
+// rivals, and on-foot police officers. Civilians flee gunfire;
+// rivals close in and swing; officers chase and, at high wanted
+// levels, shoot.
 
-const SKINS = [
-  [0.85, 0.6, 0.45], [0.6, 0.45, 0.35], [0.9, 0.75, 0.6], [0.5, 0.35, 0.28],
-];
-const SHIRTS = [
-  [0.85, 0.3, 0.3], [0.3, 0.5, 0.85], [0.3, 0.7, 0.4], [0.9, 0.7, 0.25],
-  [0.7, 0.4, 0.8], [0.85, 0.85, 0.85], [0.2, 0.2, 0.25],
-];
+import { PED_COUNT, PED_SHIRTS, PLACES } from './config.js';
+import { clampToWorld, resolveCollision } from './city.js';
+import { angleLerp, dist2D } from './math3d.js';
+import { makeRng, pick, range } from './random.js';
+import { damagePlayer } from './player.js';
 
-// A person is three boxes: legs, torso, head. One mesh per shirt colour.
-export function buildPersonMeshes(renderer) {
-  const meshes = {};
-  for (let i = 0; i < SHIRTS.length; i++) {
-    const list = newTriList();
-    const shirt = SHIRTS[i];
-    pushBox(list, 0, 0.45, 0, 0.5, 0.9, 0.3, [0.25, 0.25, 0.3]); // legs
-    pushBox(list, 0, 1.15, 0, 0.6, 0.7, 0.35, shirt, shirt); // torso
-    pushBox(list, 0, 1.75, 0, 0.42, 0.42, 0.42, SKINS[i % SKINS.length]); // head
-    meshes['person' + i] = renderer.makeMesh(list);
-  }
-  // Rivals wear red jackets; cops wear navy with a cap.
-  const rival = newTriList();
-  pushBox(rival, 0, 0.45, 0, 0.5, 0.9, 0.3, [0.15, 0.15, 0.18]);
-  pushBox(rival, 0, 1.15, 0, 0.65, 0.7, 0.38, [0.75, 0.12, 0.12], [0.85, 0.2, 0.2]);
-  pushBox(rival, 0, 1.75, 0, 0.42, 0.42, 0.42, [0.85, 0.6, 0.45]);
-  meshes.rival = renderer.makeMesh(rival);
-  const cop = newTriList();
-  pushBox(cop, 0, 0.45, 0, 0.5, 0.9, 0.3, [0.1, 0.12, 0.2]);
-  pushBox(cop, 0, 1.15, 0, 0.65, 0.7, 0.38, [0.12, 0.16, 0.35], [0.2, 0.25, 0.5]);
-  pushBox(cop, 0, 1.75, 0, 0.42, 0.42, 0.42, [0.9, 0.75, 0.6]);
-  pushBox(cop, 0, 2.0, 0, 0.46, 0.12, 0.46, [0.08, 0.1, 0.18]);
-  meshes.cop = renderer.makeMesh(cop);
-  return meshes;
-}
-
-export function makePed(id, x, z, meshKey) {
+export function makePerson(kind, x, z, shirt) {
   return {
-    id, x, z, yaw: Math.random() * Math.PI * 2, speed: 0, meshKey,
-    tx: x, tz: z, wait: 0, health: 100, flee: 0, kind: 'ped',
+    kind,
+    x, z,
+    heading: range(Math.random, 0, 6.28),
+    speed: 0,
+    shirt,
+    pants: [0.25, 0.28, 0.4],
+    health: kind === 'rival' ? 2 : kind === 'cop' ? 3 : 1,
+    targetX: x,
+    targetZ: z,
+    retarget: 0,
+    fleeing: false,
+    aggressive: false,
+    flash: 0,
+    fallenAt: -1,
+    swingCd: 0,
+    shootCd: 0,
   };
 }
 
-export function spawnPeds(rng) {
+export function createPedestrians(seedText) {
+  const rng = makeRng(seedText + '-peds');
   const peds = [];
-  for (let i = 0; i < CFG.pedCount; i++) {
-    const x = -180 + rng() * 360, z = -180 + rng() * 360;
-    const ped = makePed('ped' + i, x, z, 'person' + (i % SHIRTS.length));
-    ped.tx = x + (rng() - 0.5) * 40; ped.tz = z + (rng() - 0.5) * 40;
+  for (let i = 0; i < PED_COUNT; i++) {
+    const x = range(rng, -170, 170);
+    const z = range(rng, -170, 160);
+    const ped = makePerson('ped', x, z, pick(rng, PED_SHIRTS));
+    ped.heading = range(rng, 0, 6.28);
+    ped.targetX = range(rng, -170, 170);
+    ped.targetZ = range(rng, -170, 160);
     peds.push(ped);
   }
   return peds;
 }
 
-function pickTarget(ped, rng) {
-  ped.tx = clamp(ped.x + (rng() - 0.5) * 60, -195, 195);
-  ped.tz = clamp(ped.z + (rng() - 0.5) * 60, -195, 195);
-  ped.wait = 0;
+export function spawnRivals(G) {
+  const rivals = [];
+  for (let i = 0; i < 5; i++) {
+    const angle = (i / 5) * Math.PI * 2;
+    const rival = makePerson(
+      'rival',
+      PLACES.yard.x + Math.sin(angle) * 12,
+      PLACES.yard.z + Math.cos(angle) * 12,
+      [0.55, 0.15, 0.15],
+    );
+    rival.aggressive = true;
+    rivals.push(rival);
+  }
+  return rivals;
 }
 
-// Pedestrians stroll between random points; a gunshot or a near-miss car
-// sends them running away from the scare.
-export function updatePeds(peds, dt, city, player, scare) {
-  const rng = mulberry32(1234 + Math.floor(performance.now() / 1000) % 997);
-  for (const ped of peds) {
+export function spawnCop(G, x, z) {
+  const cop = makePerson('cop', x, z, [0.1, 0.2, 0.55]);
+  cop.pants = [0.1, 0.12, 0.2];
+  cop.aggressive = true;
+  return cop;
+}
+
+function walkToward(G, person, tx, tz, speed, dt) {
+  const d = dist2D(person.x, person.z, tx, tz);
+  if (d < 0.6) return true;
+  const targetHeading = Math.atan2(tx - person.x, tz - person.z);
+  person.heading = angleLerp(person.heading, targetHeading, Math.min(1, dt * 8));
+  let nx = person.x + Math.sin(person.heading) * speed * dt;
+  let nz = person.z + Math.cos(person.heading) * speed * dt;
+  const fixed = resolveCollision(G.city.colliders, nx, nz, 0.7);
+  const clamped = clampToWorld(fixed.x, fixed.z);
+  person.x = clamped.x;
+  person.z = clamped.z;
+  person.moving = true;
+  return false;
+}
+
+export function updatePedestrians(G, dt) {
+  const p = G.player;
+  for (const ped of G.peds) {
     if (ped.health <= 0) continue;
-    const dPlayer = dist2(ped.x, ped.z, player.x, player.z);
-    if (scare && dist2(ped.x, ped.z, scare.x, scare.z) < 30) ped.flee = 2.5;
-    if (player.inCar && dPlayer < 6 && Math.abs(player.carSpeed || 0) > 8) ped.flee = 2;
-    let speed = 1.6;
-    if (ped.flee > 0) {
-      ped.flee -= dt; speed = 4.2;
-      const away = Math.atan2(ped.x - player.x, ped.z - player.z);
-      ped.tx = ped.x + Math.sin(away) * 20; ped.tz = ped.z + Math.cos(away) * 20;
-    }
-    const d = dist2(ped.x, ped.z, ped.tx, ped.tz);
-    if (d < 2) {
-      if (ped.wait <= 0) ped.wait = 0.5 + rng() * 2;
-      ped.wait -= dt;
-      if (ped.wait <= 0) pickTarget(ped, rng);
-      ped.speed = 0;
+    if (ped.flash > 0) ped.flash -= dt;
+    ped.retarget -= dt;
+    if (ped.fleeing) {
+      const away = Math.atan2(ped.x - p.x, ped.z - p.z);
+      walkToward(G, ped, ped.x + Math.sin(away) * 20, ped.z + Math.cos(away) * 20, 7, dt);
+      if (dist2D(ped.x, ped.z, p.x, p.z) > 45) ped.fleeing = false;
       continue;
     }
-    const wantYaw = Math.atan2(ped.tx - ped.x, ped.tz - ped.z);
-    ped.yaw = angleLerp(ped.yaw, wantYaw, Math.min(1, dt * 5));
-    ped.speed = speed;
-    ped.x += Math.sin(ped.yaw) * speed * dt;
-    ped.z += Math.cos(ped.yaw) * speed * dt;
-    [ped.x, ped.z] = collideCircleBox(ped.x, ped.z, 0.5, city.colliders);
-    ped.x = clamp(ped.x, -198, 198); ped.z = clamp(ped.z, -198, 198);
+    if (ped.retarget <= 0) {
+      ped.targetX = ped.x + (Math.random() - 0.5) * 70;
+      ped.targetZ = ped.z + (Math.random() - 0.5) * 70;
+      ped.retarget = 4 + Math.random() * 5;
+    }
+    if (walkToward(G, ped, ped.targetX, ped.targetZ, 2.6, dt)) ped.retarget = 0;
+  }
+  // Fallen pedestrians get back up after a while, away from the action.
+  for (const ped of G.peds) {
+    if (ped.health <= 0 && G.time - ped.fallenAt > 25 && dist2D(ped.x, ped.z, p.x, p.z) > 40) {
+      ped.health = 1;
+      ped.fleeing = false;
+      ped.x = p.x + (Math.random() - 0.5) * 120;
+      ped.z = p.z + (Math.random() - 0.5) * 120;
+      const clamped = clampToWorld(ped.x, ped.z);
+      ped.x = clamped.x;
+      ped.z = clamped.z;
+    }
   }
 }
 
-// Rivals: spawned for mission 4, they advance on the player and shoot.
-// Returns the number of rivals still alive.
-export function updateRivals(rivals, dt, player, city, onShoot) {
-  let alive = 0;
-  for (const r of rivals) {
-    if (r.health <= 0) continue;
-    alive++;
-    const d = dist2(r.x, r.z, player.x, player.z);
-    r.shootTimer = (r.shootTimer || 0) - dt;
-    if (d > 10) {
-      const wantYaw = Math.atan2(player.x - r.x, player.z - r.z);
-      r.yaw = angleLerp(r.yaw, wantYaw, Math.min(1, dt * 4));
-      r.x += Math.sin(r.yaw) * 3.4 * dt;
-      r.z += Math.cos(r.yaw) * 3.4 * dt;
-      [r.x, r.z] = collideCircleBox(r.x, r.z, 0.5, city.colliders);
-    } else if (r.shootTimer <= 0) {
-      r.shootTimer = 1.1 + Math.random() * 0.7;
-      onShoot(r, d);
+export function updateRivals(G, dt) {
+  const p = G.player;
+  for (const rival of G.rivals) {
+    if (rival.health <= 0) continue;
+    if (rival.flash > 0) rival.flash -= dt;
+    if (rival.swingCd > 0) rival.swingCd -= dt;
+    const d = dist2D(rival.x, rival.z, p.x, p.z);
+    if (d > 2.2) {
+      walkToward(G, rival, p.x, p.z, 5.2, dt);
+    } else if (rival.swingCd <= 0 && !p.car) {
+      rival.swingCd = 1.0;
+      G.sounds.punch();
+      damagePlayer(G, 7, 'rival');
     }
   }
-  return alive;
 }
 
-// On-foot cops chase the player on foot, shoot inside 26 units, and bust on
-// touch after standing close for a second.
-export function updateCops(cops, dt, player, city, onShoot, onBust) {
-  for (const cop of cops) {
-    const d = dist2(cop.x, cop.z, player.x, player.z);
-    const wantYaw = Math.atan2(player.x - cop.x, player.z - cop.z);
-    cop.yaw = angleLerp(cop.yaw, wantYaw, Math.min(1, dt * 5));
-    cop.shootTimer = (cop.shootTimer || 0) - dt;
-    if (player.inCar) {
-      // Cops cannot catch a car: hold position and radio it in.
-      cop.speed = 0;
-      continue;
+export function updateCops(G, dt) {
+  const p = G.player;
+  for (const cop of G.cops) {
+    if (cop.health <= 0) continue;
+    if (cop.flash > 0) cop.flash -= dt;
+    if (cop.shootCd > 0) cop.shootCd -= dt;
+    const d = dist2D(cop.x, cop.z, p.x, p.z);
+    // Touching an officer while wanted means getting busted.
+    if (d < 1.7 && !p.car && G.wanted >= 1) {
+      G.enterBusted();
+      return;
     }
-    if (d > 1.6) {
-      const speed = 5.2;
-      cop.x += Math.sin(cop.yaw) * speed * dt;
-      cop.z += Math.cos(cop.yaw) * speed * dt;
-      [cop.x, cop.z] = collideCircleBox(cop.x, cop.z, 0.5, city.colliders);
-      cop.bustTimer = 0;
-    } else {
-      cop.bustTimer = (cop.bustTimer || 0) + dt;
-      if (cop.bustTimer >= CFG.copBustSeconds) onBust(cop);
+    if (d > 1.5) {
+      walkToward(G, cop, p.x, p.z, G.wanted >= 3 ? 7.5 : 6, dt);
     }
-    if (d < 26 && d > 2 && cop.shootTimer <= 0) {
-      cop.shootTimer = 1.4 + Math.random() * 0.8;
-      onShoot(cop, d);
+    // Officers open fire at wanted 3+ from medium range, on a cooldown,
+    // but keep closing in — reaching the player means a bust, not a kill.
+    if (G.wanted >= 3 && d > 10 && d < 34 && cop.shootCd <= 0 && !p.car) {
+      cop.shootCd = 1.6;
+      G.sounds.shoot();
+      cop.muzzle = 0.1;
+      damagePlayer(G, 5, 'gunfire');
     }
+    if (cop.muzzle > 0) cop.muzzle -= dt;
   }
 }
-export { mulberry32 };
+
+export function fleePeds(G, x, z, radius) {
+  for (const ped of G.peds) {
+    if (ped.health > 0 && dist2D(ped.x, ped.z, x, z) < radius) ped.fleeing = true;
+  }
+}
+
+export function drawPerson(renderer, person, time) {
+  if (person.health <= 0) {
+    // Fallen: lying flat on the ground.
+    renderer.drawBox(person.x, 0.3, person.z, person.heading, 0.85, 0.5, 1.7, person.shirt);
+    return;
+  }
+  const bob = person.moving ? Math.sin(time * 9 + person.x) * 0.06 : 0;
+  const shirt = person.flash > 0 ? [1, 1, 1] : person.shirt;
+  renderer.drawBox(person.x, 1.05 + bob, person.z, person.heading, 0.85, 1.1, 0.5, shirt);
+  renderer.drawBox(person.x, 1.95 + bob, person.z, person.heading, 0.55, 0.55, 0.55, [0.85, 0.62, 0.45]);
+  renderer.drawBox(person.x, 0.45 + bob, person.z, person.heading, 0.7, 0.9, 0.45, person.pants);
+  if (person.kind === 'cop') {
+    renderer.drawBox(person.x, 2.3 + bob, person.z, person.heading, 0.6, 0.2, 0.6, [0.08, 0.12, 0.3]);
+    if (person.muzzle > 0) {
+      const fx = Math.sin(person.heading);
+      const fz = Math.cos(person.heading);
+      renderer.drawBox(person.x + fx * 1.4, 1.2, person.z + fz * 1.4, person.heading, 0.45, 0.45, 0.45, [1, 0.9, 0.3]);
+    }
+  }
+  if (person.kind === 'rival') {
+    renderer.drawBox(person.x, 2.3 + bob, person.z, person.heading, 0.5, 0.25, 0.5, [0.15, 0.15, 0.15]);
+  }
+  person.moving = false;
+}
+
+export function drawPeople(renderer, G) {
+  for (const ped of G.peds) drawPerson(renderer, ped, G.time);
+  for (const rival of G.rivals) drawPerson(renderer, rival, G.time);
+  for (const cop of G.cops) drawPerson(renderer, cop, G.time);
+}

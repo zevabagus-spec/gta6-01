@@ -1,155 +1,256 @@
-// Solara Bay — vehicles. Every car is a box-built mesh: one shared mesh
-// per model (body, cabin, wheels, plus police light bar or taxi sign),
-// drawn with a model matrix. Traffic cars patrol the city loops, parked
-// cars wait on street edges to be stolen, and police cars hunt the player
-// while the wanted level is up.
-import { CAR_MODELS, CFG } from './config.js';
-import { mulberry32, clamp, angleLerp, dist2 } from './math3d.js';
-import { newTriList, pushBox } from './engine.js';
-import { collideCircleBox } from './city.js';
+// Cars: ambient traffic on the road grid, the parked gold Sunray,
+// police pursuit cars, and the car the player is driving — including
+// stealing. A police ram carries a per-car cooldown so a touching
+// police car can never drain health every frame.
 
-// Scale an RGB triple by a brightness factor (darker glass, lighter roof).
-function shade(rgb, f) { return [rgb[0] * f, rgb[1] * f, rgb[2] * f]; }
+import { CAR_COLORS, PLACES, RAM_COOLDOWN, TRAFFIC_COUNT, WORLD_HALF } from './config.js';
+import { clampToWorld, resolveCollision, ROAD_LINES } from './city.js';
+import { angleLerp, clamp, dist2D } from './math3d.js';
+import { makeRng, pick, range } from './random.js';
+import { damagePlayer } from './player.js';
 
-// Build one mesh per model, shared by all cars of that model. Forward is
-// +Z in model space.
-export function buildCarMeshes(renderer) {
-  const meshes = {};
-  for (const [key, model] of Object.entries(CAR_MODELS)) {
-    const list = newTriList();
-    const c = model.color;
-    const sporty = key === 'sunray' || key === 'police';
-    // Lower body, cabin, and a dark glass band on top of the cabin.
-    pushBox(list, 0, 0.55, 0, 1.9, 0.7, 4.2, c, shade(c, 1.15));
-    pushBox(list, 0, 1.15, -0.3, 1.6, 0.6, 2.2, shade(c, 0.55), shade(c, 0.7));
-    pushBox(list, 0, 1.25, -0.3, 1.4, 0.15, 2.0, [0.1, 0.12, 0.16]);
-    if (key === 'pickup') pushBox(list, 0, 1.0, -1.2, 1.7, 0.5, 1.4, shade(c, 0.8));
-    if (key === 'van') pushBox(list, 0, 1.5, -0.6, 1.8, 1.1, 2.6, shade(c, 0.9));
-    const wheel = [0.08, 0.08, 0.1];
-    for (const [wx, wz] of [[-0.95, 1.35], [0.95, 1.35], [-0.95, -1.35], [0.95, -1.35]]) {
-      pushBox(list, wx, 0.35, wz, 0.3, 0.7, 0.7, wheel);
-    }
-    if (sporty) pushBox(list, 0, 0.95, -2.0, 1.8, 0.25, 0.4, [0.1, 0.1, 0.12]);
-    if (key === 'police') {
-      pushBox(list, -0.4, 1.55, -0.3, 0.6, 0.25, 0.5, [0.9, 0.1, 0.1]);
-      pushBox(list, 0.4, 1.55, -0.3, 0.6, 0.25, 0.5, [0.1, 0.2, 0.95]);
-      pushBox(list, 0, 0.62, 2.12, 1.7, 0.35, 0.15, [0.9, 0.9, 0.85]);
-    }
-    if (key === 'taxi') pushBox(list, 0, 1.55, -0.3, 1.0, 0.3, 0.8, [0.95, 0.85, 0.2]);
-    meshes[key] = renderer.makeMesh(list);
-  }
-  return meshes;
-}
+let nextCarId = 1;
 
-export function makeCar(id, modelKey, x, z, yaw) {
-  const model = CAR_MODELS[modelKey];
+export function makeCar(kind, x, z, heading, color) {
   return {
-    id, modelKey, model, x, z, yaw, speed: 0, health: 100,
-    traffic: false, parked: false, police: modelKey === 'police',
-    loop: null, loopIndex: 0, loopSpeed: 0, stuck: 0,
+    id: nextCarId++,
+    kind,
+    x, z, heading,
+    speed: 0,
+    color,
+    stolen: false,
+    lastRamAt: -99,
+    flashPhase: Math.random() * 6.28,
+    road: null,
+    line: 0,
+    dir: 1,
+    lane: 3.5,
+    cruise: 11,
   };
 }
 
-// Fill the city's loops with traffic, staggered along random segments.
-export function spawnTraffic(city, rng) {
+export function createTraffic(seedText) {
+  const rng = makeRng(seedText + '-traffic');
   const cars = [];
-  const keys = ['sedan', 'coupe', 'pickup', 'van', 'taxi'];
-  for (let i = 0; i < CFG.trafficCount; i++) {
-    const loop = city.loops[i % city.loops.length];
-    const seg = Math.floor(rng() * loop.length);
-    const a = loop[seg], b = loop[(seg + 1) % loop.length];
-    const t = rng();
-    const x = a[0] + (b[0] - a[0]) * t, z = a[1] + (b[1] - a[1]) * t;
-    const car = makeCar('traffic' + i, keys[Math.floor(rng() * keys.length)], x, z, 0);
-    car.traffic = true; car.loop = loop; car.loopIndex = (seg + 1) % loop.length;
-    car.loopSpeed = 8 + rng() * 5;
-    car.yaw = Math.atan2(b[0] - a[0], b[1] - a[1]);
+  for (let i = 0; i < TRAFFIC_COUNT; i++) {
+    const horizontal = rng() < 0.5;
+    const line = pick(rng, ROAD_LINES);
+    const along = range(rng, -180, 180);
+    const dir = rng() < 0.5 ? 1 : -1;
+    const car = makeCar(
+      'traffic',
+      horizontal ? along : line + 3.5 * dir,
+      horizontal ? line + 3.5 * dir : along,
+      horizontal ? (dir > 0 ? Math.PI / 2 : -Math.PI / 2) : (dir > 0 ? 0 : Math.PI),
+      pick(rng, CAR_COLORS),
+    );
+    car.road = horizontal ? 'h' : 'v';
+    car.line = line;
+    car.dir = dir;
+    car.cruise = range(rng, 9, 14);
+    car.speed = car.cruise;
     cars.push(car);
   }
+  // The gold Sunray coupe, parked by Dario's garage.
+  const sunray = makeCar('parked', PLACES.sunrayParked.x, PLACES.sunrayParked.z, Math.PI / 2, [0.95, 0.72, 0.15]);
+  sunray.isSunray = true;
+  cars.push(sunray);
   return cars;
 }
 
-// Parked cars live on street edges: one coordinate on a street line, nudged
-// to the asphalt edge, never inside a block. The gold Sunray waits on Coral
-// Row (the z=-40 street) for mission 2; a taxi waits by the square.
-export function spawnParked() {
-  const spots = [
-    ['sunray', 100, -44, Math.PI / 2], ['sedan', -124, -100, 0], ['coupe', 60, 124, Math.PI],
-    ['pickup', -84, 60, -Math.PI / 2], ['van', 124, -60, Math.PI], ['sedan', 20, -124, 0],
-    ['taxi', -5, 4, Math.PI / 2], ['coupe', -100, 84, 0], ['sedan', 164, 60, -Math.PI / 2],
-    ['pickup', 60, -84, Math.PI / 2],
-  ];
-  return spots.map(([key, x, z, yaw], i) => {
-    const car = makeCar('parked' + i, key, x, z, yaw);
-    car.parked = true;
-    return car;
-  });
+export function nearestCar(G, x, z, maxDist) {
+  let best = null;
+  let bestD = maxDist;
+  for (const car of G.cars) {
+    if (car.kind === 'player') continue;
+    const d = dist2D(x, z, car.x, car.z);
+    if (d < bestD) { bestD = d; best = car; }
+  }
+  return best;
 }
 
-// Traffic steers between its loop's waypoints and pauses when another car
-// is directly ahead, so cars queue instead of passing through each other.
-export function updateTraffic(cars, dt, allCars) {
-  for (const car of cars) {
-    if (!car.traffic) continue;
-    const target = car.loop[car.loopIndex];
-    const d = dist2(car.x, car.z, target[0], target[1]);
-    if (d < 3) { car.loopIndex = (car.loopIndex + 1) % car.loop.length; continue; }
-    const wantYaw = Math.atan2(target[0] - car.x, target[1] - car.z);
-    car.yaw = angleLerp(car.yaw, wantYaw, Math.min(1, dt * 3));
-    let blocked = false;
-    for (const other of allCars) {
-      if (other === car) continue;
-      const ox = other.x - car.x, oz = other.z - car.z;
-      const forward = ox * Math.sin(car.yaw) + oz * Math.cos(car.yaw);
-      const side = Math.abs(ox * Math.cos(car.yaw) - oz * Math.sin(car.yaw));
-      if (forward > 0 && forward < 7 && side < 2.4) { blocked = true; break; }
+export function tryEnterCar(G) {
+  const p = G.player;
+  if (p.car) return false;
+  const car = nearestCar(G, p.x, p.z, 4.5);
+  if (!car) {
+    G.toast('No car close by');
+    return false;
+  }
+  const wasParked = car.kind === 'parked';
+  const wasTraffic = car.kind === 'traffic';
+  car.kind = 'player';
+  car.speed = 0;
+  p.car = car;
+  p.x = car.x;
+  p.z = car.z;
+  p.heading = car.heading;
+  G.sounds.door();
+  if (wasTraffic) {
+    car.stolen = true;
+    G.sounds.steal();
+    G.addWanted(1, 'car stolen');
+    G.toast('Car stolen! The cops noticed.');
+    G.onCarStolen(car);
+  } else if (car.isSunray) {
+    G.toast('The Sunray — Dario’s gold coupe.');
+    G.onSunrayTaken(car);
+  } else if (wasParked) {
+    G.toast('You take the parked car.');
+  }
+  return true;
+}
+
+export function exitCar(G) {
+  const p = G.player;
+  const car = p.car;
+  if (!car) return;
+  car.kind = car.stolen ? 'parked' : 'parked';
+  car.speed = 0;
+  p.car = null;
+  p.x = car.x + Math.cos(car.heading) * 3;
+  p.z = car.z - Math.sin(car.heading) * 3;
+  const fixed = resolveCollision(G.city.colliders, p.x, p.z, 0.9);
+  p.x = fixed.x;
+  p.z = fixed.z;
+  G.sounds.door();
+  G.sounds.setEngine(false, 0);
+}
+
+export function updatePlayerCar(G, dt) {
+  const p = G.player;
+  const car = p.car;
+  if (!car) return;
+  const input = G.input;
+  const accel = input.keys.has('KeyW') || input.keys.has('ArrowUp');
+  const brake = input.keys.has('KeyS') || input.keys.has('ArrowDown');
+  const left = input.keys.has('KeyA') || input.keys.has('ArrowLeft');
+  const right = input.keys.has('KeyD') || input.keys.has('ArrowRight');
+  if (accel) car.speed += 26 * dt;
+  else if (brake) car.speed -= 34 * dt;
+  else car.speed -= Math.sign(car.speed) * Math.min(Math.abs(car.speed), 8 * dt);
+  car.speed = clamp(car.speed, -10, 34);
+  const steer = (left ? 1 : 0) - (right ? 1 : 0);
+  if (steer !== 0 && Math.abs(car.speed) > 0.5) {
+    car.heading += steer * dt * 1.9 * Math.sign(car.speed) * clamp(Math.abs(car.speed) / 12, 0.4, 1);
+  }
+  const fx = Math.sin(car.heading);
+  const fz = Math.cos(car.heading);
+  let nx = car.x + fx * car.speed * dt;
+  let nz = car.z + fz * car.speed * dt;
+  const hit = resolveCollision(G.city.colliders, nx, nz, 1.6);
+  if (hit.x !== nx || hit.z !== nz) {
+    if (Math.abs(car.speed) > 8) {
+      G.sounds.crash();
+      G.shake = Math.min(1, G.shake + 0.35);
+      car.speed *= 0.25;
+    } else {
+      car.speed *= 0.5;
     }
-    car.speed = blocked ? 0 : car.loopSpeed;
-    car.x += Math.sin(car.yaw) * car.speed * dt;
-    car.z += Math.cos(car.yaw) * car.speed * dt;
+  }
+  const clamped = clampToWorld(hit.x, hit.z);
+  car.x = clamped.x;
+  car.z = clamped.z;
+  p.x = car.x;
+  p.z = car.z;
+  p.heading = car.heading;
+  G.cameraYaw = angleLerp(G.cameraYaw, car.heading, Math.min(1, dt * 1.6));
+  G.sounds.setEngine(true, Math.abs(car.speed) / 34);
+  G.speedKmh = Math.round(Math.abs(car.speed) * 3.6);
+}
+
+export function updateTraffic(G, dt) {
+  for (const car of G.cars) {
+    if (car.kind !== 'traffic') continue;
+    // Traffic cruises its road and wraps around the city edge.
+    if (car.road === 'h') {
+      car.x += car.dir * car.cruise * dt;
+      car.z = car.line + 3.5 * car.dir;
+      if (car.x > WORLD_HALF) car.x = -WORLD_HALF;
+      if (car.x < -WORLD_HALF) car.x = WORLD_HALF;
+    } else {
+      car.z += car.dir * car.cruise * dt;
+      car.x = car.line + 3.5 * car.dir;
+      if (car.z > WORLD_HALF) car.z = -WORLD_HALF;
+      if (car.z < -WORLD_HALF) car.z = WORLD_HALF;
+    }
+    // Ease off when the player's car is right ahead.
+    const p = G.player;
+    if (p.car && dist2D(car.x, car.z, p.x, p.z) < 9) {
+      const ahead = (car.x - p.x) * Math.sin(car.heading) + (car.z - p.z) * Math.cos(car.heading);
+      if (ahead > 0) car.speed = 0;
+    }
   }
 }
 
-// Police cars steer at the player and ram on contact; they despawn once the
-// wanted level clears (handled by the caller).
-export function updatePoliceCars(cars, player, dt, city, onRam) {
-  for (const car of cars) {
-    if (!car.police) continue;
-    const d = dist2(car.x, car.z, player.x, player.z);
-    const wantYaw = Math.atan2(player.x - car.x, player.z - car.z);
-    car.yaw = angleLerp(car.yaw, wantYaw, Math.min(1, dt * 2.2));
-    const targetSpeed = d > 6 ? car.model.topSpeed : car.model.topSpeed * 0.55;
-    car.speed = clamp(car.speed + (targetSpeed - car.speed) * dt * 1.2, 0, car.model.topSpeed);
-    car.x += Math.sin(car.yaw) * car.speed * dt;
-    car.z += Math.cos(car.yaw) * car.speed * dt;
-    [car.x, car.z] = collideCircleBox(car.x, car.z, 1.6, city.colliders);
-    car.x = clamp(car.x, -CFG.worldHalf, CFG.worldHalf);
-    car.z = clamp(car.z, -CFG.worldHalf, CFG.worldHalf);
-    // One ram per car per 1.2 s: without this cooldown a touching police
-    // car would empty the player's health bar within a single second.
-    car.ramCooldown = Math.max(0, (car.ramCooldown || 0) - dt);
-    if (d < 3.2 && car.ramCooldown <= 0) {
-      car.ramCooldown = 1.2;
-      onRam(car, d);
+export function updatePolice(G, dt) {
+  const p = G.player;
+  for (const car of G.cars) {
+    if (car.kind !== 'police') continue;
+    const d = dist2D(car.x, car.z, p.x, p.z);
+    const targetHeading = Math.atan2(p.x - car.x, p.z - car.z);
+    car.heading = angleLerp(car.heading, targetHeading, Math.min(1, dt * 2.4));
+    const cruise = G.wanted >= 4 ? 30 : 24;
+    car.speed = d > 6 ? cruise : 10;
+    const fx = Math.sin(car.heading);
+    const fz = Math.cos(car.heading);
+    let nx = car.x + fx * car.speed * dt;
+    let nz = car.z + fz * car.speed * dt;
+    const fixed = resolveCollision(G.city.colliders, nx, nz, 1.6);
+    // Police slide along buildings instead of stopping dead.
+    if (fixed.x !== nx || fixed.z !== nz) {
+      car.heading += dt * 1.4;
+      nx = car.x + Math.sin(car.heading) * car.speed * dt * 0.5;
+      nz = car.z + Math.cos(car.heading) * car.speed * dt * 0.5;
     }
-  }
-}
-
-// Push overlapping cars apart (circle-vs-circle) and bleed their speed.
-export function resolveCarBumps(cars) {
-  for (let i = 0; i < cars.length; i++) {
-    for (let j = i + 1; j < cars.length; j++) {
-      const a = cars[i], b = cars[j];
-      const dx = b.x - a.x, dz = b.z - a.z;
-      const d = Math.hypot(dx, dz);
-      if (d < 3.4 && d > 0.01) {
-        const push = (3.4 - d) / 2;
-        const ux = dx / d, uz = dz / d;
-        a.x -= ux * push; a.z -= uz * push;
-        b.x += ux * push; b.z += uz * push;
-        a.speed *= 0.7; b.speed *= 0.7;
+    const clamped = clampToWorld(nx, nz);
+    car.x = clamped.x;
+    car.z = clamped.z;
+    // Ram: damage with a per-car cooldown — never every frame.
+    if (d < 4.2 && G.time - car.lastRamAt >= RAM_COOLDOWN) {
+      car.lastRamAt = G.time;
+      G.sounds.crash();
+      G.shake = Math.min(1, G.shake + 0.5);
+      if (p.car) {
+        p.car.speed *= 0.4;
+        damagePlayer(G, 6, 'ram');
+      } else {
+        damagePlayer(G, 5, 'ram');
       }
     }
   }
 }
-export { mulberry32 };
+
+export function drawCar(renderer, car, time) {
+  const r = renderer;
+  const bodyY = 0.75;
+  r.drawBox(car.x, bodyY, car.z, car.heading, 2.2, 0.9, 4.6, car.color);
+  r.drawBox(car.x, bodyY + 0.75, car.z, car.heading, 1.9, 0.7, 2.4, [0.15, 0.2, 0.28]);
+  const fx = Math.sin(car.heading);
+  const fz = Math.cos(car.heading);
+  const sx = Math.cos(car.heading);
+  const sz = -Math.sin(car.heading);
+  for (const [along, side] of [[1.5, 1], [1.5, -1], [-1.5, 1], [-1.5, -1]]) {
+    r.drawBox(
+      car.x + fx * along + sx * side * 1.05,
+      0.4, car.z + fz * along + sz * side * 1.05,
+      car.heading, 0.35, 0.8, 0.8, [0.08, 0.08, 0.1],
+    );
+  }
+  // Headlights.
+  r.drawBox(car.x + fx * 2.3 + sx * 0.7, bodyY, car.z + fz * 2.3 + sz * 0.7, car.heading, 0.4, 0.3, 0.15, [1.0, 0.95, 0.7]);
+  r.drawBox(car.x + fx * 2.3 - sx * 0.7, bodyY, car.z + fz * 2.3 - sz * 0.7, car.heading, 0.4, 0.3, 0.15, [1.0, 0.95, 0.7]);
+  if (car.kind === 'police') {
+    r.drawBox(car.x, bodyY + 0.6, car.z, car.heading, 2.25, 0.5, 4.65, [0.92, 0.92, 0.95]);
+    const phase = Math.sin(time * 9 + car.flashPhase) > 0;
+    r.drawBox(car.x - sx * 0.45, bodyY + 1.35, car.z - sz * 0.45, car.heading, 0.8, 0.35, 0.6, phase ? [1, 0.1, 0.1] : [0.2, 0.2, 0.9]);
+    r.drawBox(car.x + sx * 0.45, bodyY + 1.35, car.z + sz * 0.45, car.heading, 0.8, 0.35, 0.6, phase ? [0.2, 0.2, 0.9] : [1, 0.1, 0.1]);
+  }
+  if (car.isSunray) {
+    r.drawBox(car.x, bodyY + 1.2, car.z, car.heading, 1.2, 0.25, 1.2, [1.0, 0.9, 0.4]);
+  }
+}
+
+export function drawVehicles(renderer, G) {
+  for (const car of G.cars) drawCar(renderer, car, G.time);
+}

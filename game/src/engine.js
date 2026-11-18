@@ -1,171 +1,170 @@
-// Solara Bay — hand-written WebGL renderer. One shader pair, lambert sun
-// light plus distance fog, warm sunset sky. Geometry is built from boxes:
-// a Mesh is a flat list of triangles with a baked vertex colour and normal.
-// The static city is a single Mesh drawn in one call; cars, people and props
-// are small Meshes drawn with a model matrix. No engine, no library.
-import { mat4Identity, mat4Perspective, mat4LookAt } from './math3d.js';
+// Hand-written WebGL renderer: one unit cube, one lambert shader with
+// distance fog, immediate-mode box drawing. No library, no textures,
+// no external assets — colour and light carry the whole look.
+
+import { matCompose, matLookAt, matMultiply, matPerspective } from './math3d.js';
+import { FOG_COLOR, SKY_HORIZON, SKY_TOP, SUN_DIR } from './config.js';
 
 const VERT = `
 attribute vec3 aPos;
 attribute vec3 aNormal;
-attribute vec3 aColor;
-uniform mat4 uProj;
-uniform mat4 uView;
+uniform mat4 uMVP;
 uniform mat4 uModel;
-varying vec3 vColor;
 varying vec3 vNormal;
-varying float vDepth;
+varying vec3 vWorld;
 void main() {
   vec4 world = uModel * vec4(aPos, 1.0);
-  vec4 view = uView * world;
-  vDepth = -view.z;
-  vColor = aColor;
+  vWorld = world.xyz;
   vNormal = mat3(uModel) * aNormal;
-  gl_Position = uProj * view;
+  gl_Position = uMVP * vec4(aPos, 1.0);
 }`;
+
 const FRAG = `
 precision mediump float;
-varying vec3 vColor;
+uniform vec3 uColor;
+uniform vec3 uSun;
+uniform vec3 uFog;
+uniform vec3 uCam;
 varying vec3 vNormal;
-varying float vDepth;
-uniform vec3 uSunDir;
-uniform vec3 uFogColor;
-uniform vec2 uFogRange;
-uniform float uGlow;
+varying vec3 vWorld;
 void main() {
   vec3 n = normalize(vNormal);
-  float diff = max(dot(n, uSunDir), 0.0);
-  float shade = 0.5 + 0.5 * diff;
-  vec3 col = vColor * shade + vec3(uGlow);
-  float f = clamp((vDepth - uFogRange.x) / (uFogRange.y - uFogRange.x), 0.0, 1.0);
-  gl_FragColor = vec4(mix(col, uFogColor, f), 1.0);
+  float diff = max(dot(n, normalize(uSun)), 0.0);
+  float light = 0.55 + 0.45 * diff;
+  vec3 col = uColor * light;
+  float d = distance(vWorld, uCam);
+  float fog = clamp((d - 90.0) / 220.0, 0.0, 0.75);
+  gl_FragColor = vec4(mix(col, uFog, fog), 1.0);
 }`;
 
-// One face of a box: two triangles, one outward normal, one colour.
-function pushFace(list, corners, normal, color) {
-  const [a, b, c, d] = corners;
-  list.pos.push(...a, ...b, ...c, ...a, ...c, ...d);
-  for (let i = 0; i < 6; i++) list.nor.push(...normal);
-  for (let i = 0; i < 6; i++) list.col.push(...color);
-}
-
-// Add an axis-aligned box centred at (cx, cy, cz) to a triangle list.
-// topColor tints the roof / top face so buildings read at a glance.
-export function pushBox(list, cx, cy, cz, sx, sy, sz, color, topColor) {
-  const x0 = cx - sx / 2, x1 = cx + sx / 2;
-  const y0 = cy - sy / 2, y1 = cy + sy / 2;
-  const z0 = cz - sz / 2, z1 = cz + sz / 2;
-  const top = topColor || color;
-  pushFace(list, [[x0, y1, z1], [x1, y1, z1], [x1, y1, z0], [x0, y1, z0]], [0, 1, 0], top);
-  pushFace(list, [[x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]], [0, -1, 0], color);
-  pushFace(list, [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]], [0, 0, 1], color);
-  pushFace(list, [[x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0]], [0, 0, -1], color);
-  pushFace(list, [[x1, y0, z1], [x1, y0, z0], [x1, y1, z0], [x1, y1, z1]], [1, 0, 0], color);
-  pushFace(list, [[x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0]], [-1, 0, 0], color);
-}
-// A flat quad lying on the ground (roads, sidewalks, water, plazas).
-export function pushFlat(list, cx, cz, sx, sz, y, color) {
-  pushFace(list,
-    [[cx - sx / 2, y, cz + sz / 2], [cx + sx / 2, y, cz + sz / 2], [cx + sx / 2, y, cz - sz / 2], [cx - sx / 2, y, cz - sz / 2]],
-    [0, 1, 0], color);
-}
-export function newTriList() { return { pos: [], nor: [], col: [] }; }
-export function triCount(list) { return list.pos.length / 3; }
+// Unit cube centred at the origin, 1 wide, with outward normals.
+const CUBE_POS = [
+  -0.5, -0.5, 0.5, 0.5, -0.5, 0.5, 0.5, 0.5, 0.5, -0.5, 0.5, 0.5,
+  -0.5, -0.5, -0.5, -0.5, 0.5, -0.5, 0.5, 0.5, -0.5, 0.5, -0.5, -0.5,
+  -0.5, 0.5, -0.5, -0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, -0.5,
+  -0.5, -0.5, -0.5, 0.5, -0.5, -0.5, 0.5, -0.5, 0.5, -0.5, -0.5, 0.5,
+  0.5, -0.5, -0.5, 0.5, 0.5, -0.5, 0.5, 0.5, 0.5, 0.5, -0.5, 0.5,
+  -0.5, -0.5, -0.5, -0.5, -0.5, 0.5, -0.5, 0.5, 0.5, -0.5, 0.5, -0.5,
+];
+const CUBE_NORM = [
+  0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1,
+  0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1,
+  0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0,
+  0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0,
+  1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0,
+  -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0,
+];
+const CUBE_IDX = [
+  0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7, 8, 9, 10, 8, 10, 11,
+  12, 13, 14, 12, 14, 15, 16, 17, 18, 16, 18, 19, 20, 21, 22, 20, 22, 23,
+];
 
 export class Renderer {
   constructor(canvas) {
     this.canvas = canvas;
-    this.gl = canvas.getContext('webgl', { antialias: true, preserveDrawingBuffer: true });
-    this.ok = !!this.gl;
-    if (!this.ok) return;
-    const gl = this.gl;
-    const vs = gl.createShader(gl.VERTEX_SHADER);
-    gl.shaderSource(vs, VERT); gl.compileShader(vs);
-    const fs = gl.createShader(gl.FRAGMENT_SHADER);
-    gl.shaderSource(fs, FRAG); gl.compileShader(fs);
-    if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS) || !gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
-      this.ok = false; this.error = 'shader compile failed'; return;
+    this.gl = null;
+    this.available = false;
+    this.drawCalls = 0;
+    try {
+      const gl = canvas.getContext('webgl', { antialias: true, preserveDrawingBuffer: true })
+        || canvas.getContext('experimental-webgl', { preserveDrawingBuffer: true });
+      if (!gl) return;
+      this.gl = gl;
+      const vs = this.compile(gl.VERTEX_SHADER, VERT);
+      const fs = this.compile(gl.FRAGMENT_SHADER, FRAG);
+      if (!vs || !fs) return;
+      const program = gl.createProgram();
+      gl.attachShader(program, vs);
+      gl.attachShader(program, fs);
+      gl.linkProgram(program);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) return;
+      this.program = program;
+      gl.useProgram(program);
+      this.uMVP = gl.getUniformLocation(program, 'uMVP');
+      this.uModel = gl.getUniformLocation(program, 'uModel');
+      this.uColor = gl.getUniformLocation(program, 'uColor');
+      this.uSun = gl.getUniformLocation(program, 'uSun');
+      this.uFog = gl.getUniformLocation(program, 'uFog');
+      this.uCam = gl.getUniformLocation(program, 'uCam');
+      const posBuf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(CUBE_POS), gl.STATIC_DRAW);
+      const posLoc = gl.getAttribLocation(program, 'aPos');
+      gl.enableVertexAttribArray(posLoc);
+      gl.vertexAttribPointer(posLoc, 3, gl.FLOAT, false, 0, 0);
+      const normBuf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, normBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(CUBE_NORM), gl.STATIC_DRAW);
+      const normLoc = gl.getAttribLocation(program, 'aNormal');
+      gl.enableVertexAttribArray(normLoc);
+      gl.vertexAttribPointer(normLoc, 3, gl.FLOAT, false, 0, 0);
+      const idxBuf = gl.createBuffer();
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(CUBE_IDX), gl.STATIC_DRAW);
+      gl.enable(gl.DEPTH_TEST);
+      gl.depthFunc(gl.LEQUAL);
+      this.available = true;
+    } catch (err) {
+      this.available = false;
     }
-    const prog = gl.createProgram();
-    gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog);
-    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) { this.ok = false; this.error = 'shader link failed'; return; }
-    gl.useProgram(prog);
-    this.prog = prog;
-    this.uProj = gl.getUniformLocation(prog, 'uProj');
-    this.uView = gl.getUniformLocation(prog, 'uView');
-    this.uModel = gl.getUniformLocation(prog, 'uModel');
-    this.uSunDir = gl.getUniformLocation(prog, 'uSunDir');
-    this.uFogColor = gl.getUniformLocation(prog, 'uFogColor');
-    this.uFogRange = gl.getUniformLocation(prog, 'uFogRange');
-    this.uGlow = gl.getUniformLocation(prog, 'uGlow');
-    this.aPos = gl.getAttribLocation(prog, 'aPos');
-    this.aNormal = gl.getAttribLocation(prog, 'aNormal');
-    this.aColor = gl.getAttribLocation(prog, 'aColor');
-    gl.enable(gl.DEPTH_TEST);
-    gl.enable(gl.CULL_FACE);
-    gl.cullFace(gl.BACK);
-    this.meshes = [];
   }
 
-  // Upload a triangle list once; returns a mesh handle for later draw calls.
-  makeMesh(list) {
+  compile(type, source) {
     const gl = this.gl;
-    const buf = gl.createBuffer();
-    const n = list.pos.length / 3;
-    const data = new Float32Array(n * 9);
-    for (let i = 0; i < n; i++) {
-      data.set(list.pos.slice(i * 3, i * 3 + 3), i * 9);
-      data.set(list.nor.slice(i * 3, i * 3 + 3), i * 9 + 3);
-      data.set(list.col.slice(i * 3, i * 3 + 3), i * 9 + 6);
-    }
-    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-    gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
-    const mesh = { buf, count: n };
-    this.meshes.push(mesh);
-    return mesh;
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) return null;
+    return shader;
   }
 
   resize() {
-    const dpr = Math.min(window.devicePixelRatio || 1, 1.75);
-    const w = Math.floor(this.canvas.clientWidth * dpr);
-    const h = Math.floor(this.canvas.clientHeight * dpr);
+    const ratio = Math.min(window.devicePixelRatio || 1, 1);
+    const w = Math.floor(this.canvas.clientWidth * ratio);
+    const h = Math.floor(this.canvas.clientHeight * ratio);
     if (this.canvas.width !== w || this.canvas.height !== h) {
-      this.canvas.width = w; this.canvas.height = h;
+      this.canvas.width = w;
+      this.canvas.height = h;
     }
-    this.gl.viewport(0, 0, w, h);
-    this.aspect = w / Math.max(1, h);
+    if (this.gl) this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
   }
 
-  // Begin a frame: sky colour, sun, fog, camera. Returns nothing; draw after.
-  beginFrame(camera) {
+  beginFrame(eye, target) {
     const gl = this.gl;
-    this.resize();
-    gl.clearColor(0.98, 0.72, 0.45, 1.0); // warm late-afternoon sky
+    if (!gl) return;
+    this.drawCalls = 0;
+    const top = SKY_TOP;
+    const horizon = SKY_HORIZON;
+    gl.clearColor(
+      (top[0] + horizon[0]) / 2,
+      (top[1] + horizon[1]) / 2,
+      (top[2] + horizon[2]) / 2,
+      1,
+    );
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    const proj = mat4Perspective(1.05, this.aspect || 1.6, 0.1, 900);
-    const view = mat4LookAt(camera.eye, camera.target, [0, 1, 0]);
-    gl.uniformMatrix4fv(this.uProj, false, new Float32Array(proj));
-    gl.uniformMatrix4fv(this.uView, false, new Float32Array(view));
-    // Sun low in the west so long shadows and warm faces read in screenshots.
-    gl.uniform3fv(this.uSunDir, new Float32Array([0.55, 0.62, 0.35]));
-    gl.uniform3fv(this.uFogColor, new Float32Array([0.98, 0.72, 0.45]));
-    gl.uniform2fv(this.uFogRange, new Float32Array([120, 520]));
-    gl.uniform1f(this.uGlow, 0.0);
+    const aspect = this.canvas.width / Math.max(1, this.canvas.height);
+    const proj = matPerspective(1.05, aspect, 0.1, 600);
+    const view = matLookAt(eye, target, [0, 1, 0]);
+    this.viewProj = matMultiply(proj, view);
+    this.eye = eye;
+    gl.uniform3fv(this.uSun, SUN_DIR);
+    gl.uniform3fv(this.uFog, FOG_COLOR);
+    gl.uniform3fv(this.uCam, eye);
   }
 
-  drawMesh(mesh, model, glow) {
+  drawBox(x, y, z, rotY, sx, sy, sz, color) {
     const gl = this.gl;
+    if (!gl) return;
+    const model = matCompose(x, y, z, rotY, sx, sy, sz);
     gl.uniformMatrix4fv(this.uModel, false, new Float32Array(model));
-    gl.uniform1f(this.uGlow, glow || 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.buf);
-    gl.vertexAttribPointer(this.aPos, 3, gl.FLOAT, false, 36, 0);
-    gl.enableVertexAttribArray(this.aPos);
-    gl.vertexAttribPointer(this.aNormal, 3, gl.FLOAT, false, 36, 12);
-    gl.enableVertexAttribArray(this.aNormal);
-    gl.vertexAttribPointer(this.aColor, 3, gl.FLOAT, false, 36, 24);
-    gl.enableVertexAttribArray(this.aColor);
-    gl.drawArrays(gl.TRIANGLES, 0, mesh.count);
+    gl.uniformMatrix4fv(this.uMVP, false, new Float32Array(matMultiply(this.viewProj, model)));
+    gl.uniform3fv(this.uColor, color);
+    gl.drawElements(gl.TRIANGLES, 36, gl.UNSIGNED_SHORT, 0);
+    this.drawCalls++;
   }
 
-  drawStatic(mesh) { this.drawMesh(mesh, mat4Identity(), 0); }
+  // A flat box whose centre sits at ground height y=0.
+  drawSlab(x, z, w, d, h, color) {
+    this.drawBox(x, h / 2, z, 0, w, h, d, color);
+  }
 }

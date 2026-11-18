@@ -1,112 +1,134 @@
-// Solara Bay — the HUD and the minimap. Cash, health and armour bars, wanted
-// stars, ammo, the in-game clock, the current objective, the speedometer and
-// a canvas minimap showing streets, the player, police, the mission marker
-// and Sun Coins. All DOM, updated from the world each frame.
-import { CFG, districtAt } from './config.js';
+// The HUD: cash, health, wanted stars, ammo, mission banner, toasts,
+// district banner, speed readout, and the canvas minimap.
 
-function el(id) { return document.getElementById(id); }
-function starRow(level) {
-  let s = '';
-  for (let i = 0; i < 5; i++) s += i < level ? '★' : '☆';
-  return s;
-}
+import { DISTRICTS, MISSIONS, WORLD_HALF } from './config.js';
+import { districtAt } from './config.js';
+import { ROAD_LINES } from './city.js';
 
-export function createHud() {
-  return {
-    cash: el('hud-cash'), mission: el('hud-mission'), objective: el('hud-objective'),
-    healthFill: el('hud-health-fill'), armourFill: el('hud-armour-fill'),
-    healthText: el('hud-health-text'), stars: el('hud-stars'), clock: el('hud-clock'),
-    ammo: el('hud-ammo'), speed: el('hud-speed'), district: el('hud-district'),
-    toast: el('hud-toast'), minimap: el('minimap'),
-    prompt: el('hud-prompt'), coins: el('hud-coins'),
-  };
-}
-
-export function updateHud(hud, world) {
-  const p = world.player;
-  hud.cash.textContent = `$${world.cash}`;
-  const m = world.missions;
-  hud.mission.textContent = m.done ? 'THE SOLARA JOB — COMPLETE' : `MISSION ${m.index + 1}/6`;
-  hud.objective.textContent = world.objectiveText || '';
-  hud.healthFill.style.width = `${Math.max(0, p.health)}%`;
-  hud.armourFill.style.width = `${Math.max(0, p.armour)}%`;
-  hud.healthText.textContent = `HP ${Math.ceil(p.health)}  ARM ${Math.ceil(p.armour)}`;
-  hud.stars.textContent = starRow(world.wanted.level);
-  hud.stars.classList.toggle('hot', world.wanted.level >= 3);
-  const hh = String(Math.floor(world.clockMinutes / 60) % 24).padStart(2, '0');
-  const mm = String(Math.floor(world.clockMinutes % 60)).padStart(2, '0');
-  hud.clock.textContent = `${hh}:${mm}`;
-  hud.ammo.textContent = p.inCar ? '—' : `AMMO ${p.ammo}`;
-  const kmh = Math.round(Math.abs(p.carSpeed || 0) * 3.2);
-  hud.speed.textContent = p.inCar ? `${kmh} km/h` : '';
-  hud.district.textContent = districtAt(p.x, p.z);
-  const taken = world.city.coins.filter((c) => c.taken).length;
-  hud.coins.textContent = `☀ ${taken}/${CFG.coinCount}`;
-  if (world.toastUntil > world.time) {
-    hud.toast.textContent = world.toastText;
-    hud.toast.style.opacity = '1';
-  } else {
-    hud.toast.style.opacity = '0';
+export class Hud {
+  constructor() {
+    this.el = {};
+    for (const id of ['cash', 'health-fill', 'health-text', 'stars', 'ammo', 'mission-title', 'objective', 'district', 'speed', 'toasts', 'minimap', 'weapon', 'coins']) {
+      this.el[id] = document.getElementById(id);
+    }
+    this.mapCtx = this.el.minimap ? this.el.minimap.getContext('2d') : null;
+    this.lastDistrict = '';
+    this.districtUntil = 0;
+    this.toastQueue = [];
   }
-  hud.prompt.textContent = world.promptText || '';
-  drawMinimap(hud.minimap, world);
-}
 
-function drawMinimap(canvas, world) {
-  const ctx = canvas.getContext('2d');
-  const S = canvas.width;
-  const scale = S / (CFG.worldHalf * 2 + 40);
-  const toMap = (x, z) => [(x + CFG.worldHalf + 20) * scale, (z + CFG.worldHalf + 20) * scale];
-  ctx.fillStyle = 'rgba(10, 18, 28, 0.85)';
-  ctx.fillRect(0, 0, S, S);
-  // Water on the west edge.
-  ctx.fillStyle = '#2a6a8a';
-  ctx.fillRect(0, 0, 18 * scale, S);
-  // Streets.
-  ctx.strokeStyle = '#8a8f96';
-  ctx.lineWidth = 3;
-  for (let v = -160; v <= 160; v += 40) {
-    const [x1, y1] = toMap(v, -200);
-    const [x2, y2] = toMap(v, 200);
-    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
-    const [x3, y3] = toMap(-200, v);
-    const [x4, y4] = toMap(200, v);
-    ctx.beginPath(); ctx.moveTo(x3, y3); ctx.lineTo(x4, y4); ctx.stroke();
+  toast(text, sticky) {
+    if (!this.el.toasts) return;
+    const div = document.createElement('div');
+    div.className = 'toast';
+    div.textContent = text;
+    this.el.toasts.appendChild(div);
+    while (this.el.toasts.children.length > 3) this.el.toasts.removeChild(this.el.toasts.firstChild);
+    setTimeout(() => { if (div.parentNode) div.parentNode.removeChild(div); }, sticky ? 6000 : 3600);
   }
-  // Sun Coins.
-  ctx.fillStyle = '#ffd94a';
-  for (const coin of world.city.coins) {
-    if (coin.taken) continue;
-    const [x, y] = toMap(coin.x, coin.z);
-    ctx.fillRect(x - 1.5, y - 1.5, 3, 3);
+
+  update(G) {
+    const p = G.player;
+    if (this.el.cash) this.el.cash.textContent = '$' + G.cash;
+    if (this.el['health-fill']) this.el['health-fill'].style.width = Math.max(0, p.health) + '%';
+    if (this.el['health-text']) this.el['health-text'].textContent = Math.ceil(p.health) + ' HP';
+    if (this.el.stars) {
+      let stars = '';
+      for (let i = 0; i < 5; i++) stars += i < G.wanted ? '★' : '☆';
+      this.el.stars.textContent = stars;
+      this.el.stars.className = G.wanted > 0 ? 'stars hot' : 'stars';
+    }
+    if (this.el.ammo) this.el.ammo.textContent = p.weapon === 'pistol' ? `Ammo ${p.ammo} / 12` : 'Fists';
+    if (this.el.weapon) this.el.weapon.textContent = p.weapon === 'pistol' ? 'Pistol [2]' : 'Fists [1]';
+    if (this.el.coins) this.el.coins.textContent = `☀ ${G.coinsTaken.size} / 30`;
+    const mission = MISSIONS[Math.min(5, G.missionIndex)];
+    if (this.el['mission-title']) {
+      this.el['mission-title'].textContent = G.missionIndex > 5 ? 'The Solara Job — Complete' : `Mission ${G.missionIndex + 1}/6: ${mission.title}`;
+    }
+    if (this.el.objective) this.el.objective.textContent = G.objective || '';
+    if (this.el.speed) {
+      this.el.speed.textContent = p.car ? `${G.speedKmh || 0} km/h` : '';
+    }
+    const district = districtAt(p.x, p.z);
+    if (district !== this.lastDistrict) {
+      this.lastDistrict = district;
+      this.districtUntil = G.time + 3;
+      if (this.el.district) {
+        this.el.district.textContent = district;
+        this.el.district.classList.add('show');
+      }
+    }
+    if (this.el.district && G.time > this.districtUntil) this.el.district.classList.remove('show');
+    this.drawMinimap(G);
   }
-  // Mission marker: pulsing gold diamond.
-  const marker = world.marker;
-  if (marker) {
-    const [x, y] = toMap(marker.x, marker.z);
-    const r = 5 + Math.sin(world.time * 5) * 2;
-    ctx.fillStyle = '#ffcf3f';
+
+  drawMinimap(G) {
+    const ctx = this.mapCtx;
+    if (!ctx) return;
+    const size = 180;
+    const scale = size / (WORLD_HALF * 2 + 20);
+    const toMap = (x, z) => [(x + WORLD_HALF + 10) * scale, (z + WORLD_HALF + 10) * scale];
+    ctx.clearRect(0, 0, size, size);
+    ctx.fillStyle = 'rgba(20, 28, 34, 0.82)';
+    ctx.fillRect(0, 0, size, size);
+    // Sea and beach.
+    ctx.fillStyle = '#1d6f8e';
+    ctx.fillRect(0, toMap(0, 196)[1], size, size);
+    ctx.fillStyle = '#c9a86a';
+    ctx.fillRect(0, toMap(0, 168)[1], size, toMap(0, 196)[1] - toMap(0, 168)[1]);
+    // Roads.
+    ctx.strokeStyle = '#5a636e';
+    ctx.lineWidth = 4;
+    for (const line of ROAD_LINES) {
+      const [mx] = toMap(line, 0);
+      ctx.beginPath(); ctx.moveTo(mx, 0); ctx.lineTo(mx, size); ctx.stroke();
+      const [, mz] = toMap(0, line);
+      ctx.beginPath(); ctx.moveTo(0, mz); ctx.lineTo(size, mz); ctx.stroke();
+    }
+    // District labels are skipped at this size; buildings as dots.
+    ctx.fillStyle = '#3a4550';
+    for (const b of G.city.buildings) {
+      const [mx, mz] = toMap(b.x, b.z);
+      ctx.fillRect(mx - 2, mz - 2, 4, 4);
+    }
+    // Coins.
+    ctx.fillStyle = '#ffd23f';
+    G.city.coins.forEach((coin, i) => {
+      if (coin.taken || G.coinsTaken.has(i)) return;
+      const [mx, mz] = toMap(coin.x, coin.z);
+      ctx.fillRect(mx - 1, mz - 1, 2, 2);
+    });
+    // Objective marker.
+    if (G.marker) {
+      const [mx, mz] = toMap(G.marker.x, G.marker.z);
+      ctx.fillStyle = '#ffd23f';
+      ctx.beginPath();
+      ctx.arc(mx, mz, 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+    // Police.
+    ctx.fillStyle = '#ff4d4d';
+    for (const car of G.cars) {
+      if (car.kind !== 'police') continue;
+      const [mx, mz] = toMap(car.x, car.z);
+      ctx.beginPath(); ctx.arc(mx, mz, 3, 0, Math.PI * 2); ctx.fill();
+    }
+    // Player arrow.
+    const [px, pz] = toMap(G.player.x, G.player.z);
+    ctx.save();
+    ctx.translate(px, pz);
+    ctx.rotate(Math.PI - G.player.heading);
+    ctx.fillStyle = '#fff';
     ctx.beginPath();
-    ctx.moveTo(x, y - r); ctx.lineTo(x + r, y); ctx.lineTo(x, y + r); ctx.lineTo(x - r, y);
-    ctx.closePath(); ctx.fill();
+    ctx.moveTo(0, -7);
+    ctx.lineTo(5, 5);
+    ctx.lineTo(-5, 5);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+    void DISTRICTS;
   }
-  // Police cars: flashing red/blue dots.
-  ctx.fillStyle = world.time % 0.5 < 0.25 ? '#ff4444' : '#4488ff';
-  for (const car of world.policeCars) {
-    const [x, y] = toMap(car.x, car.z);
-    ctx.beginPath(); ctx.arc(x, y, 3.5, 0, Math.PI * 2); ctx.fill();
-  }
-  // Player: white arrow pointing along the facing direction.
-  const p = world.player;
-  const [px, py] = toMap(p.x, p.z);
-  ctx.save();
-  ctx.translate(px, py);
-  ctx.rotate(Math.PI - p.yaw); // arrow drawn pointing up; map x->right, z->down
-  ctx.fillStyle = '#ffffff';
-  ctx.beginPath(); ctx.moveTo(0, -6); ctx.lineTo(4.5, 5); ctx.lineTo(-4.5, 5); ctx.closePath(); ctx.fill();
-  ctx.restore();
-  // North tick.
-  ctx.fillStyle = '#ffffff';
-  ctx.font = 'bold 10px sans-serif';
-  ctx.fillText('N', S - 12, 12);
 }
