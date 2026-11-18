@@ -1,250 +1,275 @@
-// "The Solara Job" — six missions with Dario Voss and Mara Quinn.
-// A small step machine per mission: proximity markers, timed fares,
-// a rival fight, a police escape, and the warehouse-to-boat finale.
+// The story: Mara Voss owes fixer Ilsa Marek one debt, and six jobs pay it
+// off. Missions are data-driven steps — go, talk, steal, deliver, fight,
+// collect, escape — with cash rewards, timers, and a gold beacon guiding
+// every objective. Between jobs, Ilsa's office starts the next one.
+import { distance2D } from './rng.js';
+import { CAR_MODELS } from './vehicles.js';
 
-import { MISSIONS, PLACES } from './config.js';
-import { dist2D } from './math3d.js';
-import { spawnRivals } from './pedestrians.js';
-import { clearWanted, setWanted } from './wanted.js';
-import { drawPerson, makePerson } from './pedestrians.js';
-
-const FARES = [
-  { from: { x: 32, z: -56 }, to: { x: -96, z: 104 }, name: 'the marina' },
-  { from: { x: -96, z: 104 }, to: { x: 96, z: -96 }, name: 'Glass Towers' },
-  { from: { x: 96, z: -96 }, to: { x: 32, z: -8 }, name: 'the diner' },
+export const MISSIONS = [
+  {
+    title: 'First Errand',
+    intro: 'Ilsa: "One package, one drop. Drive like the bay is watching — it is."',
+    reward: 150,
+    steps: [
+      { type: 'talk', target: 'ilsaOffice', radius: 6, text: 'Meet Ilsa at her office', contact: 'Ilsa Marek' },
+      { type: 'goto', target: 'docks', radius: 7, text: 'Deliver the package to the Solmar Docks' },
+    ],
+  },
+  {
+    title: 'Wheels Up',
+    intro: 'Ilsa: "Rook needs a Comet GT. There is one parked by the Old Market. Borrow it permanently."',
+    reward: 250,
+    steps: [
+      { type: 'steal', target: 'market', radius: 30, text: 'Steal the marked Comet GT at the Old Market', carModel: 4 },
+      { type: 'deliver', target: 'garage', radius: 9, text: 'Deliver the Comet GT to Rook\u2019s Garage' },
+    ],
+  },
+  {
+    title: 'Corner Talk',
+    intro: 'Petey saw something he should not have. Hear him out, then handle the Gulls who followed him.',
+    reward: 350,
+    steps: [
+      { type: 'talk', target: 'market', radius: 6, text: 'Hear out Petey at the Old Market', contact: 'Petey Lark' },
+      { type: 'fight', target: 'market', radius: 40, text: 'Fight off the Gulls', count: 3 },
+      { type: 'collect', target: 'market', radius: 4, text: 'Pick up Petey\u2019s package' },
+      { type: 'goto', target: 'ilsaOffice', radius: 7, text: 'Bring the package back to Ilsa' },
+    ],
+  },
+  {
+    title: 'Harbor Run',
+    intro: 'Ilsa: "A crate at the warehouse, a buyer at the docks, and 75 seconds of patience. Go."',
+    reward: 500,
+    steps: [
+      { type: 'collect', target: 'warehouse', radius: 5, text: 'Pick up the crate at the Harbor Warehouse' },
+      { type: 'deliver', target: 'docks', radius: 9, text: 'Reach the docks buyer before the timer ends', timeLimit: 75, wantedOnStart: 2 },
+    ],
+  },
+  {
+    title: 'The Exchange',
+    intro: 'The Gulls set a meet at Tower Plaza. It is a setup. Take the briefcase anyway.',
+    reward: 750,
+    steps: [
+      { type: 'fight', target: 'towerPlaza', radius: 45, text: 'Clear the Gulls at Tower Plaza', count: 5 },
+      { type: 'collect', target: 'towerPlaza', radius: 4, text: 'Take the briefcase' },
+      { type: 'goto', target: 'hideout', radius: 7, text: 'Escape to the hideout', wantedOnStart: 1 },
+    ],
+  },
+  {
+    title: 'Solmar Payday',
+    intro: 'Last job. The Gulls keep their cut behind Bay Trust Bank. Take it, and the debt dies with it.',
+    reward: 1200,
+    steps: [
+      { type: 'fight', target: 'bankFront', radius: 45, text: 'Clear the guards at Bay Trust Bank', count: 4 },
+      { type: 'collect', target: 'bankFront', radius: 4, text: 'Take the Gulls\u2019 cut' },
+      { type: 'goto', target: 'hideout', radius: 8, text: 'Lose the heat and reach the hideout', wantedOnStart: 3 },
+    ],
+  },
 ];
-const FARE_TIME = 75;
 
-export function startMission(G, index) {
-  G.missionIndex = index;
-  G.missionStep = 0;
-  G.missionData = {};
-  G.flags = {};
-  const m = MISSIONS[index];
-  if (!m) return;
-  G.toast(`${m.title} — ${m.giver}: ${m.brief}`);
-  if (index === 3) {
-    // Rivals spawn when the player reaches the yard, not before.
-  }
-  if (index === 4) {
-    setWanted(G, 4, true);
-    G.toast('Every patrol in Solara Bay is after you. Reach the hideout!');
-  }
-  if (index === 5) {
-    G.toast('The warehouse is guarded. Grab the loot and run for the boat.');
-  }
-  updateObjective(G);
-}
+export function createMissionManager(city, callbacks) {
+  const state = {
+    missionIndex: 0,
+    stepIndex: 0,
+    phase: 'idle',
+    armed: true,
+    stepTimer: 0,
+    spawnedPeds: [],
+    spawnedCars: [],
+    targetCar: null,
+    stepThugs: [],
+    storyDone: false,
+    completedCount: 0,
+  };
 
-export function updateObjective(G) {
-  const i = G.missionIndex;
-  const step = G.missionStep;
-  const d = G.missionData;
-  let text = '';
-  let marker = null;
-  if (i === 0) {
-    if (step === 0) { text = 'Meet Dario at the garage on Coral Row'; marker = PLACES.garage; }
-    else if (step === 1) { text = 'Get in the gold Sunray coupe (press F)'; marker = PLACES.sunrayParked; }
-    else { text = 'Drive the Sunray to Mara at the diner'; marker = PLACES.diner; }
-  } else if (i === 1) {
-    if (step === 0) { text = 'Steal any car on the street (press F beside one)'; marker = null; }
-    else { text = 'Deliver the stolen car to the chop shop'; marker = PLACES.chopShop; }
-  } else if (i === 2) {
-    const fare = FARES[d.fare || 0];
-    if (d.phase === 'dropoff') {
-      text = `Drop the fare at ${fare.name} — ${Math.ceil(d.timer || 0)}s left`;
-      marker = fare.to;
-    } else {
-      text = `Pick up fare ${(d.fare || 0) + 1} of 3 at the taxi stand`;
-      marker = fare.from;
+  function targetPos(step) {
+    const loc = city.locations[step.target];
+    return { x: loc.x, z: loc.z, name: loc.name };
+  }
+
+  function clearSpawned(world) {
+    for (const ped of state.spawnedPeds) {
+      const idx = world.peds.peds.indexOf(ped);
+      if (idx >= 0) world.peds.peds.splice(idx, 1);
     }
-  } else if (i === 3) {
-    if (step === 0) { text = 'Go to the freight yard'; marker = PLACES.yard; }
-    else if (step === 1) {
-      const left = G.rivals.filter((r) => r.health > 0).length;
-      text = `Send the Rust Vipers packing — ${left} left`;
-      marker = PLACES.yard;
-    } else { text = 'Meet Mara at the diner'; marker = PLACES.diner; }
-  } else if (i === 4) {
-    text = 'Escape the patrols — reach the hideout';
-    marker = PLACES.hideout;
-  } else if (i === 5) {
-    if (step === 0) { text = 'Reach the warehouse'; marker = PLACES.warehouse; }
-    else if (step === 1) {
-      const left = (d.loot || []).filter((l) => !l.taken).length;
-      text = `Grab the loot bags — ${left} left`;
-      marker = nearestLoot(G);
-    } else { text = 'Escape to the boat at the marina!'; marker = PLACES.boat; }
-  }
-  G.objective = text;
-  G.marker = marker;
-  G.markerColor = i === 5 && step === 2 ? [1, 0.3, 0.3] : [1, 0.85, 0.2];
-}
-
-function nearestLoot(G) {
-  const d = G.missionData;
-  if (!d.loot) return PLACES.warehouse;
-  let best = null;
-  let bestD = Infinity;
-  for (const bag of d.loot) {
-    if (bag.taken) continue;
-    const dist = dist2D(bag.x, bag.z, G.player.x, G.player.z);
-    if (dist < bestD) { bestD = dist; best = bag; }
-  }
-  return best || PLACES.warehouse;
-}
-
-function advance(G) {
-  G.missionStep++;
-  updateObjective(G);
-}
-
-export function completeMission(G) {
-  const m = MISSIONS[G.missionIndex];
-  G.cash += m.reward;
-  G.sounds.cash();
-  G.sounds.missionDone();
-  G.toast(`Mission complete: ${m.title} — +$${m.reward}`);
-  if (G.missionIndex >= 5) {
-    G.missionIndex = 6;
-    G.enterComplete();
-    return;
-  }
-  startMission(G, G.missionIndex + 1);
-  // Save AFTER advancing, so a continued game resumes the next mission.
-  G.saveNow();
-}
-
-export function updateMissions(G, dt) {
-  const p = G.player;
-  const i = G.missionIndex;
-  const d = G.missionData;
-  if (i > 5 || G.mode !== 'playing') return;
-
-  if (i === 0) {
-    if (G.missionStep === 0 && dist2D(p.x, p.z, PLACES.garage.x, PLACES.garage.z) < 9) {
-      G.toast('Dario: "Take the Sunray, kid. Mara is waiting at the diner."');
-      advance(G);
-    } else if (G.missionStep === 1 && p.car && p.car.isSunray) {
-      advance(G);
-    } else if (G.missionStep === 2 && dist2D(p.x, p.z, PLACES.diner.x, PLACES.diner.z) < 9) {
-      completeMission(G);
+    for (const car of state.spawnedCars) {
+      const idx = world.vehicles.cars.indexOf(car);
+      if (idx >= 0) world.vehicles.cars.splice(idx, 1);
     }
-  } else if (i === 1) {
-    if (G.missionStep === 0 && G.flags.stolen) advance(G);
-    else if (G.missionStep === 1 && p.car && dist2D(p.x, p.z, PLACES.chopShop.x, PLACES.chopShop.z) < 10) {
-      completeMission(G);
-    } else if (G.missionStep === 1 && !p.car && dist2D(p.x, p.z, PLACES.chopShop.x, PLACES.chopShop.z) < 10) {
-      const near = G.cars.find((c) => c.stolen && dist2D(c.x, c.z, p.x, p.z) < 12);
-      if (near) completeMission(G);
+    state.spawnedPeds = [];
+    state.spawnedCars = [];
+    state.stepThugs = [];
+    state.targetCar = null;
+  }
+
+  function spawnStepEntities(world, mission, step) {
+    const pos = targetPos(step);
+    if (step.type === 'talk' && step.contact) {
+      const ped = world.peds.spawnContact(pos.x + 2, pos.z + 2, step.contact);
+      state.spawnedPeds.push(ped);
     }
-  } else if (i === 2) {
-    if (d.fare === undefined) { d.fare = 0; d.phase = 'pickup'; d.timer = FARE_TIME; }
-    const fare = FARES[d.fare];
-    if (d.phase === 'pickup') {
-      if (p.car && dist2D(p.x, p.z, fare.from.x, fare.from.z) < 7) {
-        d.phase = 'dropoff';
-        d.timer = FARE_TIME;
-        G.toast(`Fare aboard — take them to ${fare.name}, fast!`);
-      } else if (!p.car && dist2D(p.x, p.z, fare.from.x, fare.from.z) < 7) {
-        G.toastOnce('taxi-car', 'You need a car to carry fares.');
-      }
-    } else {
-      d.timer -= dt;
-      if (p.car && dist2D(p.x, p.z, fare.to.x, fare.to.z) < 8) {
-        G.cash += 0;
-        G.sounds.cash();
-        G.toast(`Fare delivered! +$80 tip banked.`);
-        G.cash += 80;
-        d.fare++;
-        if (d.fare >= 3) {
-          // The mission reward covers the fares; the $80s above are the
-          // same money, so complete without double-paying.
-          G.cash -= 240;
-          completeMission(G);
-        } else {
-          d.phase = 'pickup';
-          d.timer = FARE_TIME;
-        }
-      } else if (d.timer <= 0) {
-        G.toast('Too slow — the fare walks away. Try again.');
-        d.phase = 'pickup';
-        d.timer = FARE_TIME;
+    if (step.type === 'fight') {
+      for (let i = 0; i < step.count; i += 1) {
+        const angle = (i / step.count) * Math.PI * 2;
+        const ped = world.peds.spawnThug(pos.x + Math.cos(angle) * 9, pos.z + Math.sin(angle) * 9, 'Gull ' + (i + 1));
+        state.spawnedPeds.push(ped);
+        state.stepThugs.push(ped);
       }
     }
-    updateObjective(G);
-  } else if (i === 3) {
-    if (G.missionStep === 0 && dist2D(p.x, p.z, PLACES.yard.x, PLACES.yard.z) < 14) {
-      G.rivals = spawnRivals(G);
-      G.toast('Rust Vipers: "This yard is ours now!"');
-      advance(G);
-    } else if (G.missionStep === 1 && G.rivals.length > 0 && G.rivals.every((r) => r.health <= 0)) {
-      G.toast('Yard clear. Mara is waiting at the diner.');
-      advance(G);
-    } else if (G.missionStep === 2 && dist2D(p.x, p.z, PLACES.diner.x, PLACES.diner.z) < 9) {
-      completeMission(G);
+    if (step.type === 'steal') {
+      const car = world.vehicles.spawnParkedCar();
+      car.modelIndex = step.carModel;
+      car.model = CAR_MODELS[step.carModel];
+      car.color = CAR_MODELS[step.carModel].colors[0];
+      car.x = pos.x + 5.4;
+      car.z = pos.z;
+      car.heading = Math.PI / 2;
+      state.spawnedCars.push(car);
+      state.targetCar = car;
     }
-  } else if (i === 4) {
-    if (dist2D(p.x, p.z, PLACES.hideout.x, PLACES.hideout.z) < 11) {
-      clearWanted(G);
-      G.toast('Dario: "Clean record. Nice driving."');
-      completeMission(G);
+    if (step.wantedOnStart) {
+      world.raiseWanted(step.wantedOnStart);
     }
-  } else if (i === 5) {
-    if (G.missionStep === 0 && dist2D(p.x, p.z, PLACES.warehouse.x, PLACES.warehouse.z) < 11) {
-      d.loot = [
-        { x: PLACES.warehouse.x, z: PLACES.warehouse.z - 12, taken: false },
-        { x: PLACES.warehouse.x, z: PLACES.warehouse.z, taken: false },
-        { x: PLACES.warehouse.x, z: PLACES.warehouse.z + 12, taken: false },
-      ];
-      advance(G);
-    } else if (G.missionStep === 1) {
-      for (const bag of d.loot || []) {
-        if (!bag.taken && dist2D(p.x, p.z, bag.x, bag.z) < 3.5) {
-          bag.taken = true;
-          G.sounds.coin();
-          G.toast(`Loot bag grabbed — ${(d.loot || []).filter((l) => !l.taken).length} left`);
-          if (G.wanted < 5) setWanted(G, 5, true);
+  }
+
+  function beginStep(world, mission, stepIndex) {
+    state.stepIndex = stepIndex;
+    const step = mission.steps[stepIndex];
+    state.stepTimer = step.timeLimit || 0;
+    spawnStepEntities(world, mission, step);
+    callbacks.onObjective(mission.title, step.text);
+  }
+
+  function startMission(world, index) {
+    state.missionIndex = index;
+    state.phase = 'active';
+    clearSpawned(world);
+    const mission = MISSIONS[index];
+    callbacks.onMessage(mission.intro);
+    callbacks.onMissionStart(mission.title);
+    beginStep(world, mission, 0);
+  }
+
+  function completeMission(world) {
+    const mission = MISSIONS[state.missionIndex];
+    state.completedCount += 1;
+    state.phase = 'idle';
+    // Disarm the office trigger until Mara steps away: finishing a job at
+    // the office must not instantly start the next one with no breather.
+    state.armed = false;
+    clearSpawned(world);
+    world.player.cash += mission.reward;
+    state.missionIndex += 1;
+    if (state.missionIndex >= MISSIONS.length) {
+      state.storyDone = true;
+      callbacks.onStoryComplete(mission);
+    } else {
+      callbacks.onMissionComplete(mission);
+    }
+  }
+
+  function failMission(world, reason) {
+    state.phase = 'idle';
+    clearSpawned(world);
+    callbacks.onMissionFailed(reason);
+  }
+
+  function resetToIdle(world) {
+    state.phase = 'idle';
+    state.armed = true;
+    clearSpawned(world);
+  }
+
+  // Jump straight to one step of one mission: used by screenshot staging
+  // and by automated playtests of the full mission chain.
+  function debugJumpToStep(world, missionIndex, stepIndex) {
+    state.missionIndex = missionIndex;
+    state.phase = 'active';
+    clearSpawned(world);
+    const mission = MISSIONS[missionIndex];
+    beginStep(world, mission, stepIndex);
+  }
+
+  return {
+    state,
+    startMission,
+    resetToIdle,
+    debugJumpToStep,
+    currentObjective(world) {
+      if (state.storyDone) {
+        return { title: 'FREE ROAM — STORY COMPLETE', text: 'Solmar Bay is yours. Sun coins still pay $25 each.', x: null, z: null, radius: 0, timer: 0 };
+      }
+      if (state.phase === 'idle') {
+        const office = city.locations.ilsaOffice;
+        const next = MISSIONS[state.missionIndex];
+        return { title: 'NEXT JOB: ' + next.title.toUpperCase(), text: 'Go to Ilsa\u2019s office to start the job', x: office.x, z: office.z, radius: 7, timer: 0 };
+      }
+      const mission = MISSIONS[state.missionIndex];
+      const step = mission.steps[state.stepIndex];
+      let pos = targetPos(step);
+      if (step.type === 'steal' && state.targetCar) pos = { x: state.targetCar.x, z: state.targetCar.z, name: 'Marked car' };
+      if (step.type === 'fight' && state.stepThugs.length > 0) {
+        const alive = state.stepThugs.filter((t) => !t.dead);
+        if (alive.length > 0) {
+          let nearest = alive[0];
+          let best = distance2D(world.player.x, world.player.z, nearest.x, nearest.z);
+          for (const t of alive) {
+            const d = distance2D(world.player.x, world.player.z, t.x, t.z);
+            if (d < best) { nearest = t; best = d; }
+          }
+          pos = { x: nearest.x, z: nearest.z, name: 'Gull' };
         }
       }
-      if ((d.loot || []).every((l) => l.taken)) {
-        G.toast('All loot grabbed — run for the boat!');
-        advance(G);
+      let text = step.text;
+      if (step.type === 'fight') {
+        const left = state.stepThugs.filter((t) => !t.dead).length;
+        text = step.text + ' — ' + left + ' left';
       }
-    } else if (G.missionStep === 2 && dist2D(p.x, p.z, PLACES.boat.x, PLACES.boat.z) < 9) {
-      completeMission(G);
-    }
-  }
-  if (i !== 2) updateObjective(G);
-}
-
-export function drawMissionProps(renderer, G) {
-  const d = G.missionData;
-  if (G.missionIndex === 2 && d.phase === 'pickup' && d.fare !== undefined) {
-    const fare = FARES[d.fare];
-    if (fare) {
-      const waiting = makePerson('ped', fare.from.x, fare.from.z, [0.95, 0.85, 0.3]);
-      waiting.heading = Math.sin(G.time * 0.7) * 0.5;
-      drawPerson(renderer, waiting, G.time);
-    }
-  }
-  if (G.missionIndex === 5 && G.missionStep >= 1 && d.loot) {
-    for (const bag of d.loot) {
-      if (bag.taken) continue;
-      const bob = Math.sin(G.time * 3 + bag.x) * 0.15;
-      renderer.drawBox(bag.x, 0.7 + bob, bag.z, 0.4, 1.6, 1.4, 1.2, [0.95, 0.75, 0.2]);
-      renderer.drawBox(bag.x, 1.55 + bob, bag.z, 0.4, 1.0, 0.4, 0.8, [0.7, 0.5, 0.1]);
-    }
-  }
-  // Dario waits by the garage during mission 1; Mara by the diner.
-  if (G.missionIndex === 0 && G.missionStep === 0) {
-    const dario = makePerson('ped', PLACES.garage.x + 3, PLACES.garage.z + 2, [0.2, 0.35, 0.7]);
-    dario.heading = 2.4;
-    drawPerson(renderer, dario, G.time);
-  }
-  if ((G.missionIndex === 0 && G.missionStep === 2) || (G.missionIndex === 3 && G.missionStep === 2)) {
-    const mara = makePerson('ped', PLACES.diner.x + 3, PLACES.diner.z, [0.85, 0.25, 0.5]);
-    mara.heading = -1.2;
-    drawPerson(renderer, mara, G.time);
-  }
+      return { title: mission.title.toUpperCase(), text, x: pos.x, z: pos.z, radius: step.radius || 6, timer: state.stepTimer };
+    },
+    update(dt, world) {
+      if (state.storyDone) return;
+      const player = world.player;
+      if (state.phase === 'idle') {
+        const office = city.locations.ilsaOffice;
+        const distToOffice = distance2D(player.x, player.z, office.x, office.z);
+        if (distToOffice > 12) state.armed = true;
+        if (state.armed && distToOffice < 7) {
+          startMission(world, state.missionIndex);
+        }
+        return;
+      }
+      const mission = MISSIONS[state.missionIndex];
+      const step = mission.steps[state.stepIndex];
+      if (state.stepTimer > 0) {
+        state.stepTimer -= dt;
+        if (state.stepTimer <= 0) {
+          failMission(world, 'Out of time — the buyer walked. The job is open again at Ilsa\u2019s office.');
+          return;
+        }
+      }
+      const pos = targetPos(step);
+      const dist = distance2D(player.x, player.z, pos.x, pos.z);
+      let done = false;
+      if (step.type === 'goto' || step.type === 'talk' || step.type === 'collect') {
+        done = dist < (step.radius || 6);
+        if (done && step.type === 'collect') {
+          world.effects.coinSparkle(pos.x, 1.5, pos.z);
+          world.audio.pickup();
+        }
+      } else if (step.type === 'deliver') {
+        done = player.inCar && dist < (step.radius || 9);
+      } else if (step.type === 'steal') {
+        done = player.inCar && player.car === state.targetCar;
+        if (done) world.raiseWanted(1);
+      } else if (step.type === 'fight') {
+        done = state.stepThugs.length > 0 && state.stepThugs.every((t) => t.dead);
+      }
+      if (!done) return;
+      if (state.stepIndex + 1 >= mission.steps.length) {
+        completeMission(world);
+      } else {
+        beginStep(world, mission, state.stepIndex + 1);
+      }
+    },
+  };
 }

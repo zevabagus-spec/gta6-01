@@ -1,198 +1,242 @@
-// People on the street: wandering pedestrians, the Rust Vipers
-// rivals, and on-foot police officers. Civilians flee gunfire;
-// rivals close in and swing; officers chase and, at high wanted
-// levels, shoot.
+// Pedestrians: sidewalk walkers who flee gunfire, mission thugs who fight,
+// on-foot police officers who chase and bust, and story contacts who wait
+// at markers. People are animated box figures with swinging legs.
+import { clampNumber, distance2D, pickFrom, randomRange, turnToward } from './rng.js';
+import { WORLD_HALF, resolveCircleCollision } from './city.js';
 
-import { PED_COUNT, PED_SHIRTS, PLACES } from './config.js';
-import { clampToWorld, resolveCollision } from './city.js';
-import { angleLerp, dist2D } from './math3d.js';
-import { makeRng, pick, range } from './random.js';
-import { damagePlayer } from './player.js';
+const SHIRTS = [
+  [0.85, 0.30, 0.25], [0.25, 0.50, 0.85], [0.90, 0.70, 0.20], [0.35, 0.70, 0.40],
+  [0.75, 0.45, 0.70], [0.90, 0.90, 0.88], [0.30, 0.75, 0.70], [0.95, 0.55, 0.25],
+];
+const PANTS = [[0.20, 0.25, 0.40], [0.35, 0.30, 0.25], [0.15, 0.15, 0.18], [0.45, 0.45, 0.50]];
+const SKINS = [[0.95, 0.78, 0.62], [0.75, 0.55, 0.40], [0.55, 0.38, 0.26], [0.88, 0.68, 0.52]];
 
-export function makePerson(kind, x, z, shirt) {
+let nextPedId = 1;
+
+export function makePed(kind, x, z, rand, name) {
   return {
+    id: nextPedId++,
     kind,
+    name: name || '',
     x, z,
-    heading: range(Math.random, 0, 6.28),
+    heading: rand() * Math.PI * 2,
     speed: 0,
-    shirt,
-    pants: [0.25, 0.28, 0.4],
-    health: kind === 'rival' ? 2 : kind === 'cop' ? 3 : 1,
+    walkPhase: rand() * 6.28,
+    shirt: kind === 'officer' ? [0.15, 0.25, 0.55] : pickFrom(rand, SHIRTS),
+    pants: kind === 'officer' ? [0.12, 0.14, 0.20] : pickFrom(rand, PANTS),
+    skin: pickFrom(rand, SKINS),
+    health: kind === 'thug' ? 60 : 100,
+    maxHealth: kind === 'thug' ? 60 : 100,
     targetX: x,
     targetZ: z,
-    retarget: 0,
-    fleeing: false,
-    aggressive: false,
-    flash: 0,
-    fallenAt: -1,
-    swingCd: 0,
-    shootCd: 0,
+    state: 'walk',
+    fleeTimer: 0,
+    attackCooldown: 0,
+    bustTimer: 0,
+    dead: false,
+    scared: false,
   };
 }
 
-export function createPedestrians(seedText) {
-  const rng = makeRng(seedText + '-peds');
+export function createPedestrianManager(rand, city, audio, effects) {
   const peds = [];
-  for (let i = 0; i < PED_COUNT; i++) {
-    const x = range(rng, -170, 170);
-    const z = range(rng, -170, 160);
-    const ped = makePerson('ped', x, z, pick(rng, PED_SHIRTS));
-    ped.heading = range(rng, 0, 6.28);
-    ped.targetX = range(rng, -170, 170);
-    ped.targetZ = range(rng, -170, 160);
+  const colliders = city.colliders;
+
+  function randomSidewalkSpot() {
+    const bx = pickFrom(rand, [-180, -120, -60, 0, 60, 120, 180]);
+    const bz = pickFrom(rand, [-180, -120, -60, 0, 60, 120, 180]);
+    return { x: bx + randomRange(rand, -20, 20), z: bz + randomRange(rand, -20, 20) };
+  }
+
+  function spawnWalker() {
+    const spot = randomSidewalkSpot();
+    const ped = makePed('walker', spot.x, spot.z, rand);
+    const dest = randomSidewalkSpot();
+    ped.targetX = dest.x;
+    ped.targetZ = dest.z;
     peds.push(ped);
+    return ped;
   }
-  return peds;
-}
 
-export function spawnRivals(G) {
-  const rivals = [];
-  for (let i = 0; i < 5; i++) {
-    const angle = (i / 5) * Math.PI * 2;
-    const rival = makePerson(
-      'rival',
-      PLACES.yard.x + Math.sin(angle) * 12,
-      PLACES.yard.z + Math.cos(angle) * 12,
-      [0.55, 0.15, 0.15],
-    );
-    rival.aggressive = true;
-    rivals.push(rival);
+  function spawnThug(x, z, name) {
+    const ped = makePed('thug', x, z, rand, name);
+    ped.shirt = [0.25, 0.22, 0.28];
+    ped.state = 'guard';
+    peds.push(ped);
+    return ped;
   }
-  return rivals;
-}
 
-export function spawnCop(G, x, z) {
-  const cop = makePerson('cop', x, z, [0.1, 0.2, 0.55]);
-  cop.pants = [0.1, 0.12, 0.2];
-  cop.aggressive = true;
-  return cop;
-}
-
-function walkToward(G, person, tx, tz, speed, dt) {
-  const d = dist2D(person.x, person.z, tx, tz);
-  if (d < 0.6) return true;
-  const targetHeading = Math.atan2(tx - person.x, tz - person.z);
-  person.heading = angleLerp(person.heading, targetHeading, Math.min(1, dt * 8));
-  let nx = person.x + Math.sin(person.heading) * speed * dt;
-  let nz = person.z + Math.cos(person.heading) * speed * dt;
-  const fixed = resolveCollision(G.city.colliders, nx, nz, 0.7);
-  const clamped = clampToWorld(fixed.x, fixed.z);
-  person.x = clamped.x;
-  person.z = clamped.z;
-  person.moving = true;
-  return false;
-}
-
-export function updatePedestrians(G, dt) {
-  const p = G.player;
-  for (const ped of G.peds) {
-    if (ped.health <= 0) continue;
-    if (ped.flash > 0) ped.flash -= dt;
-    ped.retarget -= dt;
-    if (ped.fleeing) {
-      const away = Math.atan2(ped.x - p.x, ped.z - p.z);
-      walkToward(G, ped, ped.x + Math.sin(away) * 20, ped.z + Math.cos(away) * 20, 7, dt);
-      if (dist2D(ped.x, ped.z, p.x, p.z) > 45) ped.fleeing = false;
-      continue;
-    }
-    if (ped.retarget <= 0) {
-      ped.targetX = ped.x + (Math.random() - 0.5) * 70;
-      ped.targetZ = ped.z + (Math.random() - 0.5) * 70;
-      ped.retarget = 4 + Math.random() * 5;
-    }
-    if (walkToward(G, ped, ped.targetX, ped.targetZ, 2.6, dt)) ped.retarget = 0;
+  function spawnOfficer(x, z) {
+    const ped = makePed('officer', x, z, rand, 'Officer');
+    ped.state = 'chase';
+    peds.push(ped);
+    return ped;
   }
-  // Fallen pedestrians get back up after a while, away from the action.
-  for (const ped of G.peds) {
-    if (ped.health <= 0 && G.time - ped.fallenAt > 25 && dist2D(ped.x, ped.z, p.x, p.z) > 40) {
-      ped.health = 1;
-      ped.fleeing = false;
-      ped.x = p.x + (Math.random() - 0.5) * 120;
-      ped.z = p.z + (Math.random() - 0.5) * 120;
-      const clamped = clampToWorld(ped.x, ped.z);
-      ped.x = clamped.x;
-      ped.z = clamped.z;
-    }
-  }
-}
 
-export function updateRivals(G, dt) {
-  const p = G.player;
-  for (const rival of G.rivals) {
-    if (rival.health <= 0) continue;
-    if (rival.flash > 0) rival.flash -= dt;
-    if (rival.swingCd > 0) rival.swingCd -= dt;
-    const d = dist2D(rival.x, rival.z, p.x, p.z);
-    if (d > 2.2) {
-      walkToward(G, rival, p.x, p.z, 5.2, dt);
-    } else if (rival.swingCd <= 0 && !p.car) {
-      rival.swingCd = 1.0;
-      G.sounds.punch();
-      damagePlayer(G, 7, 'rival');
-    }
+  function spawnContact(x, z, name) {
+    const ped = makePed('contact', x, z, rand, name);
+    ped.shirt = [0.95, 0.85, 0.30];
+    ped.state = 'wait';
+    peds.push(ped);
+    return ped;
   }
-}
 
-export function updateCops(G, dt) {
-  const p = G.player;
-  for (const cop of G.cops) {
-    if (cop.health <= 0) continue;
-    if (cop.flash > 0) cop.flash -= dt;
-    if (cop.shootCd > 0) cop.shootCd -= dt;
-    const d = dist2D(cop.x, cop.z, p.x, p.z);
-    // Touching an officer while wanted means getting busted.
-    if (d < 1.7 && !p.car && G.wanted >= 1) {
-      G.enterBusted();
+  function movePed(ped, dt, speed) {
+    const nx = ped.x + Math.sin(ped.heading) * speed * dt;
+    const nz = ped.z - Math.cos(ped.heading) * speed * dt;
+    const [rx, rz] = resolveCircleCollision(nx, nz, 0.8, colliders);
+    ped.x = rx;
+    ped.z = rz;
+    ped.speed = speed;
+    ped.walkPhase += speed * dt * 1.6;
+  }
+
+  function updateWalker(ped, dt, player) {
+    if (ped.scared) {
+      ped.fleeTimer -= dt;
+      const away = Math.atan2(ped.x - player.x, -(ped.z - player.z));
+      ped.heading = turnToward(ped.heading, away, 5 * dt);
+      movePed(ped, dt, 6.5);
+      if (ped.fleeTimer <= 0) ped.scared = false;
       return;
     }
-    if (d > 1.5) {
-      walkToward(G, cop, p.x, p.z, G.wanted >= 3 ? 7.5 : 6, dt);
+    const dist = distance2D(ped.x, ped.z, ped.targetX, ped.targetZ);
+    if (dist < 3) {
+      const dest = randomSidewalkSpot();
+      ped.targetX = dest.x;
+      ped.targetZ = dest.z;
+      return;
     }
-    // Officers open fire at wanted 3+ from medium range, on a cooldown,
-    // but keep closing in — reaching the player means a bust, not a kill.
-    if (G.wanted >= 3 && d > 10 && d < 34 && cop.shootCd <= 0 && !p.car) {
-      cop.shootCd = 1.6;
-      G.sounds.shoot();
-      cop.muzzle = 0.1;
-      damagePlayer(G, 5, 'gunfire');
+    const desired = Math.atan2(ped.targetX - ped.x, -(ped.targetZ - ped.z));
+    ped.heading = turnToward(ped.heading, desired, 3 * dt);
+    movePed(ped, dt, 2.2);
+  }
+
+  function updateThug(ped, dt, player, onPlayerHit) {
+    ped.attackCooldown = Math.max(0, ped.attackCooldown - dt);
+    const dist = distance2D(ped.x, ped.z, player.x, player.z);
+    if (ped.state === 'guard' && dist < 26) ped.state = 'chase';
+    if (ped.state !== 'chase') {
+      ped.speed = 0;
+      return;
     }
-    if (cop.muzzle > 0) cop.muzzle -= dt;
-  }
-}
-
-export function fleePeds(G, x, z, radius) {
-  for (const ped of G.peds) {
-    if (ped.health > 0 && dist2D(ped.x, ped.z, x, z) < radius) ped.fleeing = true;
-  }
-}
-
-export function drawPerson(renderer, person, time) {
-  if (person.health <= 0) {
-    // Fallen: lying flat on the ground.
-    renderer.drawBox(person.x, 0.3, person.z, person.heading, 0.85, 0.5, 1.7, person.shirt);
-    return;
-  }
-  const bob = person.moving ? Math.sin(time * 9 + person.x) * 0.06 : 0;
-  const shirt = person.flash > 0 ? [1, 1, 1] : person.shirt;
-  renderer.drawBox(person.x, 1.05 + bob, person.z, person.heading, 0.85, 1.1, 0.5, shirt);
-  renderer.drawBox(person.x, 1.95 + bob, person.z, person.heading, 0.55, 0.55, 0.55, [0.85, 0.62, 0.45]);
-  renderer.drawBox(person.x, 0.45 + bob, person.z, person.heading, 0.7, 0.9, 0.45, person.pants);
-  if (person.kind === 'cop') {
-    renderer.drawBox(person.x, 2.3 + bob, person.z, person.heading, 0.6, 0.2, 0.6, [0.08, 0.12, 0.3]);
-    if (person.muzzle > 0) {
-      const fx = Math.sin(person.heading);
-      const fz = Math.cos(person.heading);
-      renderer.drawBox(person.x + fx * 1.4, 1.2, person.z + fz * 1.4, person.heading, 0.45, 0.45, 0.45, [1, 0.9, 0.3]);
+    const desired = Math.atan2(player.x - ped.x, -(player.z - ped.z));
+    ped.heading = turnToward(ped.heading, desired, 4 * dt);
+    if (dist > 1.6) {
+      movePed(ped, dt, 4.6);
+    } else if (ped.attackCooldown <= 0) {
+      ped.attackCooldown = 1.0;
+      onPlayerHit(8, ped);
     }
   }
-  if (person.kind === 'rival') {
-    renderer.drawBox(person.x, 2.3 + bob, person.z, person.heading, 0.5, 0.25, 0.5, [0.15, 0.15, 0.15]);
+
+  function updateOfficer(ped, dt, player) {
+    const dist = distance2D(ped.x, ped.z, player.x, player.z);
+    const desired = Math.atan2(player.x - ped.x, -(player.z - ped.z));
+    ped.heading = turnToward(ped.heading, desired, 4.5 * dt);
+    if (dist > 1.8) {
+      movePed(ped, dt, 5.4);
+      ped.bustTimer = 0;
+    } else {
+      ped.speed = 0;
+      ped.bustTimer += dt;
+    }
   }
-  person.moving = false;
+
+  function drawPed(drawList, ped, timeSeconds) {
+    void timeSeconds;
+    const swing = Math.sin(ped.walkPhase) * clampNumber(ped.speed / 5, 0, 1) * 0.5;
+    const cosH = Math.cos(ped.heading);
+    const sinH = Math.sin(ped.heading);
+    const local = (lx, lz) => [ped.x + lx * cosH + lz * sinH, ped.z - lx * sinH + lz * cosH];
+    drawList.groundQuads.push({ x: ped.x, z: ped.z, sx: 1.4, sz: 1.4, color: [0.10, 0.10, 0.12], glow: 0, y: 0.05 });
+    if (ped.dead) {
+      drawList.boxes.push({ x: ped.x, y: 0.3, z: ped.z, sx: 1.7, sy: 0.6, sz: 0.7, ry: ped.heading, color: ped.shirt, glow: 0 });
+      return;
+    }
+    const [legLX, legLZ] = local(-0.22, swing * 0.5);
+    const [legRX, legRZ] = local(0.22, -swing * 0.5);
+    drawList.boxes.push({ x: legLX, y: 0.45, z: legLZ, sx: 0.3, sy: 0.9, sz: 0.3, ry: ped.heading, color: ped.pants, glow: 0 });
+    drawList.boxes.push({ x: legRX, y: 0.45, z: legRZ, sx: 0.3, sy: 0.9, sz: 0.3, ry: ped.heading, color: ped.pants, glow: 0 });
+    drawList.boxes.push({ x: ped.x, y: 1.25, z: ped.z, sx: 0.75, sy: 0.75, sz: 0.45, ry: ped.heading, color: ped.shirt, glow: 0 });
+    const [armLX, armLZ] = local(-0.5, -swing * 0.4);
+    const [armRX, armRZ] = local(0.5, swing * 0.4);
+    drawList.boxes.push({ x: armLX, y: 1.25, z: armLZ, sx: 0.22, sy: 0.7, sz: 0.22, ry: ped.heading, color: ped.shirt, glow: 0 });
+    drawList.boxes.push({ x: armRX, y: 1.25, z: armRZ, sx: 0.22, sy: 0.7, sz: 0.22, ry: ped.heading, color: ped.shirt, glow: 0 });
+    drawList.boxes.push({ x: ped.x, y: 1.95, z: ped.z, sx: 0.5, sy: 0.5, sz: 0.5, ry: ped.heading, color: ped.skin, glow: 0 });
+    if (ped.kind === 'officer') {
+      drawList.boxes.push({ x: ped.x, y: 2.28, z: ped.z, sx: 0.56, sy: 0.18, sz: 0.56, ry: ped.heading, color: [0.10, 0.14, 0.28], glow: 0 });
+    }
+    if (ped.kind === 'thug' && ped.health < ped.maxHealth) {
+      drawList.groundQuads.push({ x: ped.x, z: ped.z, sx: 1.6, sz: 0.3, color: [0.3, 0.05, 0.05], glow: 0, y: 0.08 });
+    }
+  }
+
+  return {
+    peds,
+    spawnWalker,
+    spawnThug,
+    spawnOfficer,
+    spawnContact,
+    populate() {
+      for (let i = 0; i < 26; i += 1) spawnWalker();
+    },
+    scareNearby(x, z, radius) {
+      for (const ped of peds) {
+        if (ped.kind !== 'walker' || ped.dead) continue;
+        if (distance2D(x, z, ped.x, ped.z) < radius) {
+          ped.scared = true;
+          ped.fleeTimer = 4;
+        }
+      }
+    },
+    update(dt, player, onPlayerHit) {
+      for (const ped of peds) {
+        if (ped.dead) continue;
+        if (ped.kind === 'walker') updateWalker(ped, dt, player);
+        else if (ped.kind === 'thug') updateThug(ped, dt, player, onPlayerHit);
+        else if (ped.kind === 'officer') updateOfficer(ped, dt, player);
+        else ped.speed = 0;
+        ped.x = clampNumber(ped.x, -WORLD_HALF, WORLD_HALF);
+        ped.z = clampNumber(ped.z, -WORLD_HALF, WORLD_HALF);
+      }
+      const walkers = peds.filter((p) => p.kind === 'walker' && !p.dead).length;
+      if (walkers < 22) spawnWalker();
+    },
+    removeByKind(kind) {
+      for (let i = peds.length - 1; i >= 0; i -= 1) {
+        if (peds[i].kind === kind) peds.splice(i, 1);
+      }
+    },
+    countKind(kind) {
+      return peds.filter((p) => p.kind === kind && !p.dead).length;
+    },
+    nearestThug(x, z, maxDist) {
+      let best = null;
+      let bestDist = maxDist;
+      for (const ped of peds) {
+        if (ped.kind !== 'thug' || ped.dead) continue;
+        const d = distance2D(x, z, ped.x, ped.z);
+        if (d < bestDist) { best = ped; bestDist = d; }
+      }
+      return best;
+    },
+    drawInto(drawList, timeSeconds) {
+      for (const ped of peds) drawPed(drawList, ped, timeSeconds);
+    },
+  };
 }
 
-export function drawPeople(renderer, G) {
-  for (const ped of G.peds) drawPerson(renderer, ped, G.time);
-  for (const rival of G.rivals) drawPerson(renderer, rival, G.time);
-  for (const cop of G.cops) drawPerson(renderer, cop, G.time);
+export function damagePed(ped, amount, effects) {
+  if (ped.dead) return false;
+  ped.health -= amount;
+  effects.hitSparks(ped.x, 1.4, ped.z);
+  if (ped.health <= 0) {
+    ped.health = 0;
+    ped.dead = true;
+    ped.speed = 0;
+    return true;
+  }
+  if (ped.kind === 'thug') ped.state = 'chase';
+  return false;
 }

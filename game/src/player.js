@@ -1,179 +1,178 @@
-// The player on foot: movement, sprint, punching, pistol fire, weapon
-// switching, reloading, and stepping into and out of cars.
+// Mara Voss: on-foot movement, health, cash, wanted level, weapon state,
+// and getting in and out of cars. Mara is drawn as a distinct figure —
+// teal jacket, dark jeans — so she reads at a glance in every screenshot.
+import { clampNumber, distance2D, turnToward } from './rng.js';
+import { WORLD_HALF, resolveCircleCollision } from './city.js';
 
-import { clampToWorld, resolveCollision } from './city.js';
-import { MAX_AMMO, START_AMMO, START_HEALTH } from './config.js';
-import { angleLerp, clamp, dist2D } from './math3d.js';
-
-export function createPlayer(spawn) {
+export function createPlayer(spawnX, spawnZ) {
   return {
-    x: spawn.x,
-    z: spawn.z,
+    x: spawnX,
+    z: spawnZ,
     heading: Math.PI,
-    health: START_HEALTH,
-    ammo: START_AMMO,
+    moveHeading: Math.PI,
+    speed: 0,
+    walkPhase: 0,
+    health: 100,
+    maxHealth: 100,
+    cash: 120,
+    wanted: 0,
+    cooling: false,
+    coolTimer: 0,
     weapon: 'fists',
-    attackCd: 0,
-    reloadUntil: 0,
-    reloading: false,
+    ammo: 24,
+    reserveAmmo: 48,
+    meleeCooldown: 0,
+    shootCooldown: 0,
+    reloadTimer: 0,
+    inCar: false,
     car: null,
-    punchFlash: 0,
-    muzzleFlash: 0,
+    kills: 0,
+    carsStolen: 0,
+    coinsFound: 0,
+    punchSwing: 0,
+    hurtFlash: 0,
   };
 }
 
-export function updatePlayerOnFoot(G, dt) {
-  const p = G.player;
-  const input = G.input;
-  if (p.attackCd > 0) p.attackCd -= dt;
-  if (p.punchFlash > 0) p.punchFlash -= dt;
-  if (p.muzzleFlash > 0) p.muzzleFlash -= dt;
-  if (p.reloading && G.time >= p.reloadUntil) {
-    p.ammo = MAX_AMMO;
-    p.reloading = false;
-    G.toast('Pistol reloaded');
-  }
-
-  // Camera-relative movement: forward is where the camera looks.
-  const yaw = G.cameraYaw;
-  let mx = 0;
-  let mz = 0;
-  if (input.keys.has('KeyW') || input.keys.has('ArrowUp')) { mx += Math.sin(yaw); mz += Math.cos(yaw); }
-  if (input.keys.has('KeyS') || input.keys.has('ArrowDown')) { mx -= Math.sin(yaw); mz -= Math.cos(yaw); }
-  if (input.keys.has('KeyA')) { mx += Math.cos(yaw); mz -= Math.sin(yaw); }
-  if (input.keys.has('KeyD')) { mx -= Math.cos(yaw); mz += Math.sin(yaw); }
-  const len = Math.hypot(mx, mz);
-  const sprint = input.keys.has('ShiftLeft') || input.keys.has('ShiftRight');
-  const speed = sprint ? 12 : 7.5;
-  if (len > 0) {
-    mx /= len;
-    mz /= len;
-    const targetHeading = Math.atan2(mx, mz);
-    p.heading = angleLerp(p.heading, targetHeading, Math.min(1, dt * 12));
-    let nx = p.x + mx * speed * dt;
-    let nz = p.z + mz * speed * dt;
-    const fixed = resolveCollision(G.city.colliders, nx, nz, 0.9);
-    const clamped = clampToWorld(fixed.x, fixed.z);
-    p.x = clamped.x;
-    p.z = clamped.z;
-    p.moving = true;
-  } else {
-    p.moving = false;
-  }
-
-  // Arrow keys turn the camera when not walking forward/back.
-  if (input.keys.has('ArrowLeft')) G.cameraYaw += dt * 2.2;
-  if (input.keys.has('ArrowRight')) G.cameraYaw -= dt * 2.2;
-
-  if (input.consumePress('Digit1')) { p.weapon = 'fists'; G.toast('Fists ready'); }
-  if (input.consumePress('Digit2')) { p.weapon = 'pistol'; G.toast('Pistol ready'); }
-  if (input.consumePress('KeyR') && p.weapon === 'pistol' && !p.reloading && p.ammo < MAX_AMMO) {
-    p.reloading = true;
-    p.reloadUntil = G.time + 1.0;
-    G.toast('Reloading…');
-  }
-}
-
-function coneHit(G, range, halfAngle) {
-  const p = G.player;
-  const targets = [...G.rivals, ...G.cops, ...G.peds];
-  let best = null;
-  let bestD = Infinity;
-  for (const t of targets) {
-    if (t.health <= 0) continue;
-    const d = dist2D(p.x, p.z, t.x, t.z);
-    if (d > range) continue;
-    const ang = Math.atan2(t.x - p.x, t.z - p.z);
-    let diff = ang - p.heading;
-    while (diff > Math.PI) diff -= Math.PI * 2;
-    while (diff < -Math.PI) diff += Math.PI * 2;
-    if (Math.abs(diff) > halfAngle) continue;
-    if (d < bestD) { bestD = d; best = t; }
-  }
-  return best;
-}
-
-export function playerAttack(G) {
-  const p = G.player;
-  if (p.car || p.attackCd > 0 || p.reloading) return;
-  if (p.weapon === 'fists') {
-    p.attackCd = 0.45;
-    p.punchFlash = 0.18;
-    G.sounds.punch();
-    const target = coneHit(G, 3.2, 1.1);
-    if (target) {
-      target.health -= 1;
-      target.flash = 0.2;
-      target.aggressive = true;
-      if (target.kind === 'rival') {
-        G.toast('Rival down! ' + G.rivals.filter((r) => r.health > 0).length + ' left');
-      } else if (target.kind === 'cop') {
-        G.addWanted(1, 'assaulted an officer');
-      } else if (target.health <= 0) {
-        G.addWanted(2, 'pedestrian down');
-        G.toast('The cops saw that!');
-      }
-      if (target.health <= 0) target.fallenAt = G.time;
+export function updatePlayerOnFoot(player, moveX, moveZ, sprint, cameraYaw, dt, colliders) {
+  player.meleeCooldown = Math.max(0, player.meleeCooldown - dt);
+  player.shootCooldown = Math.max(0, player.shootCooldown - dt);
+  player.punchSwing = Math.max(0, player.punchSwing - dt);
+  player.hurtFlash = Math.max(0, player.hurtFlash - dt);
+  if (player.reloadTimer > 0) {
+    player.reloadTimer -= dt;
+    if (player.reloadTimer <= 0) {
+      const need = 24 - player.ammo;
+      const take = Math.min(need, player.reserveAmmo);
+      player.ammo += take;
+      player.reserveAmmo -= take;
     }
-  } else {
-    if (p.ammo <= 0) {
-      G.toast('Out of ammo — press R to reload');
-      G.sounds.door();
-      p.attackCd = 0.3;
-      return;
-    }
-    p.ammo -= 1;
-    p.attackCd = 0.32;
-    p.muzzleFlash = 0.09;
-    G.sounds.shoot();
-    G.fleePeds(p.x, p.z, 30);
-    const target = coneHit(G, 46, 0.32);
-    if (target) {
-      target.health -= 2;
-      target.flash = 0.2;
-      target.aggressive = true;
-      if (target.kind === 'cop') G.addWanted(1, 'shot at police');
-      else if (target.kind === 'ped' && target.health <= 0) G.addWanted(2, 'pedestrian down');
-      if (target.health <= 0) target.fallenAt = G.time;
-    }
-    if (G.wanted === 0 && !target) G.addWanted(1, 'shots fired');
-    else if (G.wanted > 0) G.lastCrimeAt = G.time;
+  }
+  const moving = moveX !== 0 || moveZ !== 0;
+  if (!moving) {
+    player.speed = Math.max(0, player.speed - 30 * dt);
+    return;
+  }
+  // Movement is camera-relative: W runs away from the camera.
+  const forwardX = Math.sin(cameraYaw);
+  const forwardZ = -Math.cos(cameraYaw);
+  const rightX = Math.cos(cameraYaw);
+  const rightZ = Math.sin(cameraYaw);
+  let dx = forwardX * -moveZ + rightX * moveX;
+  let dz = forwardZ * -moveZ + rightZ * moveX;
+  const len = Math.sqrt(dx * dx + dz * dz) || 1;
+  dx /= len;
+  dz /= len;
+  const targetSpeed = sprint ? 9.5 : 5.5;
+  player.speed += clampNumber(targetSpeed - player.speed, -30 * dt, 22 * dt);
+  const desiredHeading = Math.atan2(dx, -dz);
+  player.heading = turnToward(player.heading, desiredHeading, 10 * dt);
+  const nx = player.x + dx * player.speed * dt;
+  const nz = player.z + dz * player.speed * dt;
+  const [rx, rz] = resolveCircleCollision(nx, nz, 0.8, colliders);
+  player.x = rx;
+  player.z = rz;
+  player.walkPhase = (player.walkPhase + player.speed * dt * 1.7) % (Math.PI * 2);
+  player.x = clampNumber(player.x, -WORLD_HALF, WORLD_HALF);
+  player.z = clampNumber(player.z, -WORLD_HALF, WORLD_HALF);
+}
+
+export function damagePlayer(player, amount) {
+  if (player.health <= 0) return true;
+  player.health = Math.max(0, player.health - amount);
+  player.hurtFlash = 0.35;
+  return player.health <= 0;
+}
+
+export function healPlayer(player, amount) {
+  player.health = Math.min(player.maxHealth, player.health + amount);
+}
+
+export function addCash(player, amount) {
+  player.cash = Math.max(0, player.cash + amount);
+}
+
+export function raiseWanted(player, amount) {
+  player.wanted = clampNumber(player.wanted + amount, 0, 5);
+  player.cooling = false;
+  player.coolTimer = 0;
+}
+
+export function lowerWanted(player) {
+  player.wanted = 0;
+  player.cooling = false;
+  player.coolTimer = 0;
+}
+
+export function enterCar(player, car, stolen) {
+  player.inCar = true;
+  player.car = car;
+  car.kind = 'player';
+  player.x = car.x;
+  player.z = car.z;
+  player.heading = car.heading;
+  player.speed = 0;
+  if (stolen) player.carsStolen += 1;
+}
+
+export function exitCar(player, colliders) {
+  const car = player.car;
+  if (!car) return;
+  const sideX = Math.cos(car.heading);
+  const sideZ = Math.sin(car.heading);
+  let ex = car.x + sideX * 3.2;
+  let ez = car.z + sideZ * 3.2;
+  const [rx, rz] = resolveCircleCollision(ex, ez, 0.8, colliders);
+  ex = rx;
+  ez = rz;
+  player.x = ex;
+  player.z = ez;
+  player.heading = car.heading;
+  player.speed = 0;
+  player.inCar = false;
+  player.car = null;
+  car.kind = 'parked';
+  car.speed = 0;
+}
+
+export function syncPlayerToCar(player) {
+  if (player.inCar && player.car) {
+    player.x = player.car.x;
+    player.z = player.car.z;
+    player.heading = player.car.heading;
+    player.speed = Math.abs(player.car.speed);
   }
 }
 
-export function damagePlayer(G, amount, cause) {
-  const p = G.player;
-  if (G.mode !== 'playing' || G.godUntil > G.time) return;
-  p.health = Math.max(0, p.health - amount);
-  G.shake = Math.min(1, G.shake + 0.4);
-  if (p.health <= 0) {
-    if (cause === 'busted') G.enterBusted();
-    else G.enterWasted();
+export function drawPlayer(drawList, player) {
+  if (player.inCar) return;
+  const swing = Math.sin(player.walkPhase) * clampNumber(player.speed / 6, 0, 1) * 0.55;
+  const cosH = Math.cos(player.heading);
+  const sinH = Math.sin(player.heading);
+  const local = (lx, lz) => [player.x + lx * cosH + lz * sinH, player.z - lx * sinH + lz * cosH];
+  drawList.groundQuads.push({ x: player.x, z: player.z, sx: 1.5, sz: 1.5, color: [0.10, 0.10, 0.12], glow: 0, y: 0.05 });
+  const jacket = [0.10, 0.65, 0.62];
+  const jeans = [0.18, 0.22, 0.38];
+  const [legLX, legLZ] = local(-0.22, swing * 0.5);
+  const [legRX, legRZ] = local(0.22, -swing * 0.5);
+  drawList.boxes.push({ x: legLX, y: 0.45, z: legLZ, sx: 0.3, sy: 0.9, sz: 0.3, ry: player.heading, color: jeans, glow: 0 });
+  drawList.boxes.push({ x: legRX, y: 0.45, z: legRZ, sx: 0.3, sy: 0.9, sz: 0.3, ry: player.heading, color: jeans, glow: 0 });
+  drawList.boxes.push({ x: player.x, y: 1.25, z: player.z, sx: 0.78, sy: 0.78, sz: 0.48, ry: player.heading, color: jacket, glow: 0 });
+  const punch = player.punchSwing > 0 ? 0.8 : 0;
+  const [armLX, armLZ] = local(-0.52, -swing * 0.4 - punch);
+  const [armRX, armRZ] = local(0.52, swing * 0.4);
+  drawList.boxes.push({ x: armLX, y: 1.25, z: armLZ, sx: 0.22, sy: 0.7, sz: 0.22, ry: player.heading, color: jacket, glow: 0 });
+  drawList.boxes.push({ x: armRX, y: 1.25, z: armRZ, sx: 0.22, sy: 0.7, sz: 0.22, ry: player.heading, color: jacket, glow: 0 });
+  drawList.boxes.push({ x: player.x, y: 1.97, z: player.z, sx: 0.52, sy: 0.52, sz: 0.52, ry: player.heading, color: [0.88, 0.68, 0.52], glow: 0 });
+  drawList.boxes.push({ x: player.x, y: 2.26, z: player.z, sx: 0.56, sy: 0.2, sz: 0.56, ry: player.heading, color: [0.35, 0.20, 0.12], glow: 0 });
+  if (player.weapon === 'pistol') {
+    const [gunX, gunZ] = local(0.55, -0.7);
+    drawList.boxes.push({ x: gunX, y: 1.25, z: gunZ, sx: 0.14, sy: 0.14, sz: 0.55, ry: player.heading, color: [0.12, 0.12, 0.14], glow: 0 });
   }
+  // Soft gold ring so Mara is findable in busy shots.
+  drawList.groundQuads.push({ x: player.x, z: player.z, sx: 2.0, sz: 2.0, color: [1.0, 0.85, 0.3], glow: 0.25, y: 0.07 });
 }
 
-export function healPlayer(G, amount) {
-  G.player.health = clamp(G.player.health + amount, 0, START_HEALTH);
-}
-
-export function drawPlayer(renderer, G) {
-  const p = G.player;
-  if (p.car) return;
-  const bob = p.moving ? Math.sin(G.time * 10) * 0.08 : 0;
-  const shirt = [0.95, 0.55, 0.15];
-  const skin = [0.85, 0.62, 0.45];
-  renderer.drawBox(p.x, 1.05 + bob, p.z, p.heading, 0.85, 1.1, 0.5, shirt);
-  renderer.drawBox(p.x, 1.95 + bob, p.z, p.heading, 0.55, 0.55, 0.55, skin);
-  renderer.drawBox(p.x, 0.45 + bob, p.z, p.heading, 0.7, 0.9, 0.45, [0.2, 0.25, 0.55]);
-  // Arms swing forward on a punch; pistol arm extends when firing.
-  const reach = p.punchFlash > 0 ? 0.9 : p.weapon === 'pistol' ? 0.7 : 0.45;
-  const fx = Math.sin(p.heading);
-  const fz = Math.cos(p.heading);
-  renderer.drawBox(p.x + fx * reach, 1.2 + bob, p.z + fz * reach, p.heading, 0.28, 0.28, 0.7, skin);
-  if (p.weapon === 'pistol') {
-    renderer.drawBox(p.x + fx * (reach + 0.35), 1.2 + bob, p.z + fz * (reach + 0.35), p.heading, 0.14, 0.14, 0.5, [0.12, 0.12, 0.14]);
-  }
-  if (p.muzzleFlash > 0) {
-    renderer.drawBox(p.x + fx * 1.6, 1.2, p.z + fz * 1.6, p.heading, 0.5, 0.5, 0.5, [1.0, 0.9, 0.3]);
-  }
+export function distanceToPlayer(player, x, z) {
+  return distance2D(player.x, player.z, x, z);
 }

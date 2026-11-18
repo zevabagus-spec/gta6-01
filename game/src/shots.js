@@ -1,96 +1,96 @@
-// Deterministic ?shot= staging for screenshots. Each named scene puts
-// the player, cars, police and mission state somewhere photogenic and
-// starts the game there, so every capture shows several systems at
-// once. Unknown values are ignored and the title screen shows.
+// Deterministic screenshot staging: ?shot=<scene>&seed=<n> puts the game in
+// an exact composed scene so screenshots are reproducible. Unknown scene
+// names are ignored and the game starts normally at the title screen.
+import { raiseWanted } from './player.js';
+import { CAR_MODELS } from './vehicles.js';
 
-import { PLACES } from './config.js';
-import { setWanted } from './wanted.js';
-import { startMission } from './missions.js';
-import { tryEnterCar } from './vehicles.js';
+export const SHOT_SCENES = ['cover', 'street', 'drive', 'mission'];
 
-export function shotName() {
-  try {
-    return new URLSearchParams(window.location.search).get('shot') || '';
-  } catch (err) {
-    return '';
+export function parseShotParams(search) {
+  const params = new URLSearchParams(search || '');
+  const shot = params.get('shot') || '';
+  const seedRaw = parseInt(params.get('seed') || '', 10);
+  return {
+    shot: SHOT_SCENES.includes(shot) ? shot : '',
+    seed: Number.isFinite(seedRaw) ? seedRaw : 20261118,
+    autostart: params.get('autostart') === '1' || SHOT_SCENES.includes(shot),
+  };
+}
+
+function placePlayerInCar(world, x, z, heading, modelIndex) {
+  const car = world.vehicles.spawnParkedCar();
+  car.modelIndex = modelIndex;
+  car.model = CAR_MODELS[modelIndex];
+  car.color = CAR_MODELS[modelIndex].colors[0];
+  car.x = x;
+  car.z = z;
+  car.heading = heading;
+  car.speed = 0;
+  world.player.x = x;
+  world.player.z = z;
+  world.player.heading = heading;
+  world.enterCarDirect(car);
+  return car;
+}
+
+function spawnChase(world, x, z) {
+  const spots = [
+    [x - 18, z + 14], [x - 26, z - 6], [x + 16, z + 20],
+  ];
+  for (const [cx, cz] of spots) {
+    const car = world.vehicles.spawnPoliceCar(cx, cz);
+    car.heading = Math.atan2(x - cx, -(z - cz));
+    car.speed = 20;
   }
 }
 
-export function applyShot(G, name) {
-  const p = G.player;
-  // Drop the boot-up toasts so the staged scene shows one clean brief.
-  const toasts = document.getElementById('toasts');
-  if (toasts) toasts.innerHTML = '';
-  if (name === 'chase') {
-    // Gold Sunray at speed, wanted 4, police flanking, downtown behind.
-    startMission(G, 4);
-    G.cash = 890;
-    p.x = 20; p.z = -20;
-    const sunray = G.cars.find((c) => c.isSunray);
-    if (sunray) {
-      sunray.x = 20; sunray.z = -20; sunray.heading = Math.PI / 2;
-      p.x = sunray.x; p.z = sunray.z;
-      tryEnterCar(G);
-      if (p.car) p.car.speed = 22;
+export function stageShotScene(world, scene) {
+  const player = world.player;
+  if (scene === 'cover') {
+    // Chase + wanted + minimap + mission objective, all at once: jump to
+    // the timed Harbor Run delivery leg, which already raises 2 stars.
+    world.missions.debugJumpToStep(world, 3, 1);
+    raiseWanted(world.player, 1);
+    const car = placePlayerInCar(world, -30, 60, Math.PI, 4);
+    car.speed = 24;
+    spawnChase(world, -30, 60);
+    world.cameraYaw = Math.PI;
+    world.cameraPitch = 0.32;
+    world.hud.showToast('Harbor Run — reach the docks buyer!', 6);
+  } else if (scene === 'street') {
+    // On foot on the beach promenade: open sightlines, palms, water to the
+    // west, skyline to the east, walkers around Mara.
+    player.x = -214;
+    player.z = 20;
+    player.heading = 0;
+    world.cameraYaw = 0;
+    world.cameraPitch = 0.28;
+    for (let i = 0; i < 6; i += 1) {
+      const ped = world.peds.spawnWalker();
+      ped.x = -214 + (i % 3) * 4 - 4;
+      ped.z = 8 - i * 5;
+      ped.targetX = -214;
+      ped.targetZ = -40 + i * 12;
     }
-    G.cameraYaw = Math.PI / 2;
-    setWanted(G, 4, true);
-    // Pull the patrols in close for the frame, spread wide so the
-    // gold Sunray stays visible in the middle of the chase.
-    const police = G.cars.filter((c) => c.kind === 'police');
-    const offsets = [[-8, -9], [-16, 9], [10, -7], [16, 8]];
-    police.forEach((car, i) => {
-      const off = offsets[i % offsets.length];
-      car.x = p.x + off[0];
-      car.z = p.z + off[1];
-      car.heading = Math.PI / 2;
-    });
-    G.startPlaying();
-  } else if (name === 'street') {
-    // On foot on the road north of the diner: traffic passes on the
-    // road, the diner beacon glows ahead, a cop closes in. The player
-    // stands ON the road so the camera behind stays on the road too
-    // and never ends up inside a building.
-    startMission(G, 0);
-    G.missionStep = 2;
-    G.cash = 250;
-    p.x = 32; p.z = 40; p.heading = Math.PI;
-    p.weapon = 'pistol';
-    G.cameraYaw = Math.PI;
-    setWanted(G, 1, false);
-    const cop = G.cops[0];
-    if (cop) { cop.x = 32; cop.z = 26; }
-    G.startPlaying();
-  } else if (name === 'heist') {
-    // The finale: loot in hand, wanted 5, the boat and the sea ahead,
-    // patrols closing from the north. Police start well back so the
-    // player and the boat stay visible in the frame.
-    startMission(G, 5);
-    G.missionStep = 2;
-    G.missionData.loot = [
-      { x: 0, z: 0, taken: true },
-      { x: 0, z: 0, taken: true },
-      { x: 0, z: 0, taken: true },
-    ];
-    G.cash = 1190;
-    p.x = PLACES.boat.x; p.z = 172; p.heading = 0;
-    p.weapon = 'pistol';
-    G.cameraYaw = 0;
-    setWanted(G, 5, true);
-    // Patrols flank the pier so they are visible in the frame instead
-    // of approaching from behind the camera.
-    const police = G.cars.filter((c) => c.kind === 'police');
-    const offsets = [[-14, -4], [14, -4], [-20, -10], [20, -10], [-24, -2]];
-    police.forEach((car, i) => {
-      const off = offsets[i % offsets.length];
-      car.x = p.x + off[0];
-      car.z = p.z + off[1];
-      car.heading = 0;
-    });
-    G.startPlaying();
-  } else if (name === 'title') {
-    // Title screen over a slow view of the city; the game stays put.
-    p.x = -8; p.z = 24; p.heading = Math.PI;
-    G.cameraYaw = 0.6;
+    world.hud.showToast('Solmar Beach promenade — explore on foot', 6);
+  } else if (scene === 'drive') {
+    // Waterfront drive along the promenade at speed.
+    const car = placePlayerInCar(world, -212, -120, 0, 0);
+    car.speed = 26;
+    world.cameraYaw = 0;
+    world.cameraPitch = 0.30;
+    world.hud.showToast('Coastal drive — Solmar Beach', 6);
+  } else if (scene === 'mission') {
+    // Mission 5 shootout: thugs closing in, pistol out, objective live.
+    // Player stands south of Tower Plaza facing north (heading 0) toward it.
+    world.missions.startMission(world, 4);
+    player.x = 30;
+    player.z = 60;
+    player.heading = 0;
+    player.weapon = 'pistol';
+    player.ammo = 24;
+    world.cameraYaw = 0;
+    world.cameraPitch = 0.30;
+    world.hud.showToast('The Exchange — clear the Gulls at Tower Plaza', 6);
   }
 }
