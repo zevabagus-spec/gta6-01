@@ -1,66 +1,79 @@
-// save: localStorage persistence with a session-only fallback when storage
-// is unavailable (private mode, disabled cookies). Autosaves every 15 s.
-import { SAVE_KEY } from './config.js';
+// Solara Bay — saving. Progress (mission, cash, coins, health, armour,
+// ammo, clock) goes to localStorage, autosaved every 15 seconds and on
+// mission completion. If storage is unavailable or the saved data is corrupt,
+// the game falls back to a session-only save and keeps playing.
+import { CFG, MISSIONS } from './config.js';
 
-export function createSaveApi(g) {
-  let memoryOnly = false;
-  let memorySave = null;
-  const api = {
-    available() {
-      try {
-        localStorage.setItem('__solara_probe', '1');
-        localStorage.removeItem('__solara_probe');
-        return true;
-      } catch (e) { return false; }
-    },
-    save() {
-      if (g.screen !== 'playing' && !g.completed) return;
-      const data = {
-        v: 1, cash: Math.floor(g.cash), missionIndex: g.missionIndex,
-        health: g.health, armour: g.armour, ammo: g.ammo,
-        x: g.playerPos.x, z: g.playerPos.z,
-        coins: g.coins.map((c) => c.taken ? 1 : 0).join(''),
-        pickups: g.pickups.map((p) => p.taken ? 1 : 0).join(''),
-        clockMinutes: g.clockMinutes, time: Date.now(),
-      };
-      try {
-        localStorage.setItem(SAVE_KEY, JSON.stringify(data));
-      } catch (e) {
-        memoryOnly = true;
-        memorySave = data;
-      }
-      g.lastSaveAt = g.time;
-    },
-    load() {
-      let raw = null;
-      try { raw = localStorage.getItem(SAVE_KEY); } catch (e) { raw = null; }
-      if (!raw && memorySave) raw = JSON.stringify(memorySave);
-      if (!raw) return null;
-      try { return JSON.parse(raw); } catch (e) { return null; }
-    },
-    hasSave() { return api.load() !== null; },
-    apply(data) {
-      g.cash = data.cash ?? 250;
-      g.health = data.health ?? 100;
-      g.armour = data.armour ?? 0;
-      g.ammo = data.ammo ?? 12;
-      g.clockMinutes = data.clockMinutes ?? 540;
-      g.playerPos.x = data.x ?? 20;
-      g.playerPos.z = data.z ?? -128;
-      g.playerMesh.position.set(g.playerPos.x, 0, g.playerPos.z);
-      if (data.coins) for (let i = 0; i < data.coins.length && i < g.coins.length; i++) {
-        if (data.coins[i] === '1') { g.coins[i].taken = true; g.coins[i].mesh.visible = false; }
-      }
-      if (data.pickups) for (let i = 0; i < data.pickups.length && i < g.pickups.length; i++) {
-        if (data.pickups[i] === '1') { g.pickups[i].taken = true; g.pickups[i].mesh.visible = false; g.pickups[i].cap.visible = false; }
-      }
-      return data.missionIndex ?? 0;
-    },
-    clear() {
-      try { localStorage.removeItem(SAVE_KEY); } catch (e) { /* ignore */ }
-      memorySave = null;
-    },
-  };
-  g.saveApi = api;
-  return api;
+export class SaveGame {
+  constructor() {
+    this.available = true;
+    this.sessionOnly = null;
+    try {
+      const probe = '__solara_probe__';
+      localStorage.setItem(probe, '1');
+      localStorage.removeItem(probe);
+    } catch {
+      this.available = false;
+    }
+  }
+
+  save(world) {
+    const data = {
+      version: 1,
+      missionIndex: Math.min(world.missions.index, MISSIONS.length - 1),
+      cash: world.cash,
+      coins: world.city.coins.filter((c) => c.taken).map((c) => `${c.x},${c.z}`),
+      health: world.player.health,
+      armour: world.player.armour,
+      ammo: world.player.ammo,
+      clockMinutes: world.clockMinutes,
+      savedAt: Date.now(),
+    };
+    if (this.available) {
+      try { localStorage.setItem(CFG.saveKey, JSON.stringify(data)); return true; }
+      catch { this.available = false; }
+    }
+    this.sessionOnly = data;
+    return false;
+  }
+
+  load() {
+    let raw = null;
+    if (this.available) {
+      try { raw = localStorage.getItem(CFG.saveKey); } catch { raw = null; }
+    } else if (this.sessionOnly) {
+      return this.sessionOnly;
+    }
+    if (!raw) return null;
+    try {
+      const data = JSON.parse(raw);
+      if (!data || data.version !== 1 || typeof data.missionIndex !== 'number') return null;
+      if (data.missionIndex < 0 || data.missionIndex >= MISSIONS.length) return null;
+      return data;
+    } catch {
+      return null; // corrupt save: start fresh rather than crash
+    }
+  }
+
+  hasSave() { return this.load() !== null; }
+
+  clear() {
+    this.sessionOnly = null;
+    if (this.available) { try { localStorage.removeItem(CFG.saveKey); } catch { /* ignore */ } }
+  }
+}
+
+// Apply a loaded save to a fresh world. Coins taken stay taken; the player
+// restarts at the Downtown plaza at the start of the saved mission.
+export function applySave(world, data) {
+  world.missions.index = data.missionIndex;
+  world.missions.step = 0;
+  world.cash = data.cash;
+  world.player.health = data.health ?? 100;
+  world.player.armour = data.armour ?? 0;
+  world.player.ammo = data.ammo ?? CFG.pistolAmmo;
+  world.clockMinutes = data.clockMinutes ?? 540;
+  const taken = new Set(data.coins || []);
+  for (const coin of world.city.coins) coin.taken = taken.has(`${coin.x},${coin.z}`);
+  world.player.x = -40; world.player.z = 60;
 }
