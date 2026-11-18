@@ -1,152 +1,94 @@
-// wanted: the 0–5 star heat system. Crimes raise stars (with a short
-// per-crime cooldown so one punch cannot jump you to five); the heat cools
-// when you lay low. Police cars chase and ram; from 3 stars, on-foot cops
-// spawn, shoot at you, and bust you on touch.
-import * as THREE from '../vendor/three.min.js';
-import { MAX_WANTED, dist2d, clamp } from './config.js';
-import { makePersonMesh } from './pedestrians.js';
-import { createCar } from './vehicles.js';
-import { damagePlayer } from './player.js';
+// Solara Bay — the wanted system. Crimes raise the level from 0 to 5; the
+// level decays when the player lies low, but a mission can lock it (escape
+// missions). Police cars spawn up to the level's count and on-foot cops join
+// at level 3. Spawns happen on streets near the player, never on top of them.
+import { CFG } from './config.js';
+import { mulberry32, dist2 } from './math3d.js';
+import { makeCar } from './vehicles.js';
 
-export function createWantedApi(g) {
-  g.wanted = 0;
-  g.wantedCooldowns = {};
-  g.policeCars = [];
-  g.cops = [];
-  g.heatTimer = 0;
-  const api = {
-    addWanted(n, kind) {
-      const now = g.time;
-      if (g.wantedCooldowns[kind] && now - g.wantedCooldowns[kind] < 2) return;
-      g.wantedCooldowns[kind] = now;
-      g.wanted = clamp(g.wanted + n, 0, MAX_WANTED);
-      g.heatTimer = 0;
-      if (n >= 2) g.hudApi.toast('WANTED LEVEL ' + g.wanted + ' — the police are coming');
-      g.audio.siren(g.wanted > 0);
-    },
-    setWanted(n) {
-      g.wanted = clamp(n, 0, MAX_WANTED);
-      g.heatTimer = 0;
-      g.audio.siren(g.wanted > 0);
-    },
-    clearWanted() {
-      g.wanted = 0;
-      g.audio.siren(false);
-    },
-    // Deterministic staging helpers for ?shot= screenshots.
-    spawnPoliceCarForShot(x, z, heading) {
-      const pc = spawnPoliceCar(g);
-      pc.mesh.position.set(x, 0, z);
-      pc.mesh.rotation.y = heading || 0;
-      pc.speed = 34;
-      return pc;
-    },
-    spawnCopsForShot(spots) {
-      for (const [x, z] of spots) {
-        const cop = spawnCop(g);
-        cop.x = x; cop.z = z;
-        cop.mesh.position.set(x, 0, z);
-      }
-    },
+export function createWanted() {
+  return { level: 0, locked: 0, decayTimer: 0, crimeTimer: 0 };
+}
+
+export function addWanted(world, amount, reason) {
+  const w = world.wanted;
+  if (w.locked > 0) return;
+  w.level = Math.min(5, w.level + amount);
+  w.decayTimer = CFG.wantedDecaySeconds;
+  w.crimeTimer = 3;
+  if (w.level > 0) world.toast(`Wanted level ${w.level} — ${reason}`, 2.5);
+}
+
+// Decay one star at a time while the player commits no crime and no police
+// car is close.
+export function updateWanted(world, dt, policeCars) {
+  const w = world.wanted;
+  if (w.locked > 0) { w.level = w.locked; return; }
+  w.crimeTimer = Math.max(0, w.crimeTimer - dt);
+  if (w.level === 0) return;
+  let near = false;
+  for (const car of policeCars) {
+    if (dist2(car.x, car.z, world.player.x, world.player.z) < 45) { near = true; break; }
+  }
+  if (w.crimeTimer <= 0 && !near) {
+    w.decayTimer -= dt;
+    if (w.decayTimer <= 0) {
+      w.level -= 1;
+      w.decayTimer = CFG.wantedDecaySeconds;
+      if (w.level === 0) world.toast('You lost the Bay Patrol.', 2.5);
+    }
+  } else {
+    w.decayTimer = CFG.wantedDecaySeconds;
+  }
+}
+
+// Keep the right number of police cars and cops alive for the current level.
+export function syncPolice(world, rng) {
+  const level = world.wanted.level;
+  const wantCars = level === 0 ? 0 : Math.min(CFG.maxPoliceCars, level === 5 ? 4 : level + (level >= 4 ? 1 : 0));
+  while (world.policeCars.length < wantCars) {
+    world.policeCars.push(spawnPoliceCar(world, rng));
+  }
+  while (world.policeCars.length > wantCars) {
+    const car = world.policeCars.pop();
+    const i = world.cars.indexOf(car);
+    if (i >= 0) world.cars.splice(i, 1);
+  }
+  const wantCops = level >= 3 ? Math.min(CFG.maxCops, level - 2) : 0;
+  while (world.cops.length < wantCops) world.cops.push(spawnCop(world, rng));
+  while (world.cops.length > wantCops) world.cops.pop();
+}
+
+function streetSpotNear(world, rng, minD, maxD) {
+  for (let tries = 0; tries < 12; tries++) {
+    const ang = rng() * Math.PI * 2;
+    const d = minD + rng() * (maxD - minD);
+    const x = world.player.x + Math.cos(ang) * d;
+    const z = world.player.z + Math.sin(ang) * d;
+    if (Math.abs(x) > CFG.worldHalf - 10 || Math.abs(z) > CFG.worldHalf - 10) continue;
+    // Snap onto the nearest street so police appear on roads, not in blocks.
+    const sx = Math.round(x / 40) * 40;
+    const sz = Math.round(z / 40) * 40;
+    const useX = Math.abs(x - sx) < Math.abs(z - sz);
+    return useX ? [sx, z] : [x, sz];
+  }
+  return [world.player.x + 60, world.player.z];
+}
+
+function spawnPoliceCar(world, rng) {
+  const [x, z] = streetSpotNear(world, rng, 55, 85);
+  const car = makeCar('police' + world.policeCars.length + Date.now() % 1000, 'police', x, z, 0);
+  car.speed = 12;
+  world.cars.push(car);
+  return car;
+}
+
+function spawnCop(world, rng) {
+  const [x, z] = streetSpotNear(world, rng, 25, 45);
+  return {
+    id: 'cop' + world.cops.length + Date.now() % 1000, x, z,
+    yaw: 0, health: 100, meshKey: 'cop', kind: 'cop',
+    shootTimer: 1, bustTimer: 0, speed: 0,
   };
-  g.wantedApi = api;
-  return api;
 }
-
-function spawnPoliceCar(g) {
-  const car = createCar(0x1c1c22, 'police');
-  const a = Math.random() * Math.PI * 2;
-  const x = clamp(g.playerPos.x + Math.cos(a) * 55, -140, 140);
-  const z = clamp(g.playerPos.z + Math.sin(a) * 55, -140, 140);
-  car.position.set(x, 0, z);
-  g.scene.add(car);
-  const pc = { mesh: car, speed: 0, ramCooldown: 0 };
-  g.policeCars.push(pc);
-  return pc;
-}
-
-function spawnCop(g) {
-  const mesh = makePersonMesh(0x1d2a44, 0x14181f);
-  const a = Math.random() * Math.PI * 2;
-  const x = clamp(g.playerPos.x + Math.cos(a) * 28, -140, 140);
-  const z = clamp(g.playerPos.z + Math.sin(a) * 28, -140, 140);
-  mesh.position.set(x, 0, z);
-  g.scene.add(mesh);
-  const cop = { mesh, x, z, hp: 100, kind: 'cop', shootTimer: 1 + Math.random() };
-  g.cops.push(cop);
-  return cop;
-}
-
-export function updateWanted(g, dt) {
-  // Heat cools off after 20 quiet seconds, one star at a time.
-  if (g.wanted > 0) {
-    g.heatTimer += dt;
-    if (g.heatTimer > 20) { g.wanted -= 1; g.heatTimer = 0; g.audio.siren(g.wanted > 0); }
-  }
-  // Police cars: one per star, up to 4.
-  const wantCars = Math.min(g.wanted, 4);
-  while (g.policeCars.length < wantCars) spawnPoliceCar(g);
-  // On-foot cops from 3 stars: one per star above 2.
-  const wantCops = g.wanted >= 3 ? g.wanted - 2 : 0;
-  const liveCops = g.cops.filter((c) => c.hp > 0).length;
-  if (liveCops < wantCops) spawnCop(g);
-
-  const px = g.driving ? g.playerCar.position.x : g.playerPos.x;
-  const pz = g.driving ? g.playerCar.position.z : g.playerPos.z;
-  for (const pc of g.policeCars) {
-    const m = pc.mesh;
-    const dx = px - m.position.x, dz = pz - m.position.z;
-    const d = Math.hypot(dx, dz);
-    const want = Math.atan2(dx, dz);
-    let diff = want - m.rotation.y;
-    while (diff > Math.PI) diff -= Math.PI * 2;
-    while (diff < -Math.PI) diff += Math.PI * 2;
-    m.rotation.y += clamp(diff, -2.4 * dt, 2.4 * dt);
-    pc.speed = Math.min(pc.speed + 12 * dt, d > 25 ? 42 : 34);
-    m.position.x += Math.sin(m.rotation.y) * pc.speed * dt;
-    m.position.z += Math.cos(m.rotation.y) * pc.speed * dt;
-    for (const w of m.userData.wheels) w.rotation.x += pc.speed * dt * 1.4;
-    // Flashing light bar.
-    const on = Math.floor(g.time * 6) % 2 === 0;
-    if (m.userData.lights) {
-      m.userData.lights[0].material.color.setHex(on ? 0xff2222 : 0x550000);
-      m.userData.lights[1].material.color.setHex(on ? 0x000055 : 0x2244ff);
-    }
-    // Ram: damage the player on contact, then back off briefly.
-    pc.ramCooldown -= dt;
-    if (d < 3.2 && pc.ramCooldown <= 0) {
-      pc.ramCooldown = 1.2;
-      g.audio.crash();
-      g.cameraShake = 0.4;
-      if (g.driving) g.carSpeed *= 0.5;
-      if (damagePlayer(g, 8)) g.onWasted();
-    }
-  }
-  // Cops on foot: close in, shoot, bust on touch.
-  for (const c of g.cops) {
-    if (c.hp <= 0) continue;
-    const dx = px - c.x, dz = pz - c.z;
-    const d = Math.hypot(dx, dz);
-    if (d < 1.8 && !g.driving) { g.onBusted(); return; }
-    if (d > 6) {
-      const sp = 5.2;
-      c.x += (dx / d) * sp * dt;
-      c.z += (dz / d) * sp * dt;
-      c.mesh.rotation.y = Math.atan2(dx, dz);
-    }
-    c.mesh.position.set(c.x, 0, c.z);
-    c.shootTimer -= dt;
-    if (c.shootTimer <= 0 && d < 38 && !g.driving) {
-      c.shootTimer = 1.6;
-      g.audio.enemyShot();
-      if (Math.random() < 0.55 && damagePlayer(g, 6)) g.onWasted();
-    }
-  }
-  // Despawn police far away once the heat is off.
-  if (g.wanted === 0) {
-    for (const pc of g.policeCars) g.scene.remove(pc.mesh);
-    g.policeCars = [];
-    for (const c of g.cops) if (c.hp > 0) g.scene.remove(c.mesh);
-    g.cops = g.cops.filter((c) => c.hp <= 0);
-  }
-}
+export { mulberry32 };
