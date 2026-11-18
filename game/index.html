@@ -3,124 +3,120 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Solara Bay — The Solara Job</title>
-<style>
-  html, body { margin: 0; height: 100%; overflow: hidden; background: #101820; font-family: "Segoe UI", system-ui, sans-serif; color: #fff; }
-  #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
-  .hidden { display: none !important; }
-  /* HUD */
-  #hud { position: fixed; inset: 0; pointer-events: none; z-index: 5; }
-  #hud-top-left { position: absolute; top: 14px; left: 16px; text-shadow: 0 2px 6px rgba(0,0,0,.7); }
-  #cash { font-size: 30px; font-weight: 800; color: #7dff9a; letter-spacing: 1px; }
-  #health-bar { width: 220px; height: 12px; background: rgba(0,0,0,.55); border-radius: 6px; margin-top: 6px; overflow: hidden; border: 1px solid rgba(255,255,255,.35); }
-  #health-fill { height: 100%; width: 100%; background: linear-gradient(90deg, #ff5a4e, #ffb347); transition: width .2s; }
-  #health-text { font-size: 12px; opacity: .9; }
-  #stars { font-size: 26px; letter-spacing: 4px; color: #ffd23f; margin-top: 4px; }
-  #stars.hot { color: #ff5a4e; animation: pulse 1s infinite; }
-  @keyframes pulse { 50% { opacity: .55; } }
-  #ammo-line { font-size: 15px; margin-top: 4px; }
-  #coins { font-size: 15px; color: #ffd23f; margin-top: 2px; }
-  #mission-box { position: absolute; top: 14px; left: 50%; transform: translateX(-50%); text-align: center; text-shadow: 0 2px 6px rgba(0,0,0,.8); max-width: 60vw; }
-  #mission-title { font-size: 20px; font-weight: 800; color: #ffd23f; }
-  #objective { font-size: 15px; background: rgba(0,0,0,.45); padding: 5px 14px; border-radius: 14px; margin-top: 5px; display: inline-block; }
-  #district { position: absolute; top: 110px; left: 50%; transform: translateX(-50%); font-size: 26px; font-weight: 800; letter-spacing: 3px; opacity: 0; transition: opacity .4s; text-shadow: 0 2px 8px rgba(0,0,0,.8); }
-  #district.show { opacity: 1; }
-  #minimap-wrap { position: absolute; left: 16px; bottom: 16px; border: 3px solid rgba(255,255,255,.75); border-radius: 8px; overflow: hidden; box-shadow: 0 4px 14px rgba(0,0,0,.5); }
-  #minimap { display: block; width: 180px; height: 180px; }
-  #speed { position: absolute; right: 18px; bottom: 52px; font-size: 26px; font-weight: 800; text-shadow: 0 2px 6px rgba(0,0,0,.8); }
-  #hint { position: absolute; right: 18px; bottom: 16px; font-size: 12px; opacity: .85; text-shadow: 0 1px 4px rgba(0,0,0,.8); text-align: right; max-width: 340px; }
-  #toasts { position: absolute; bottom: 210px; left: 50%; transform: translateX(-50%); text-align: center; }
-  .toast { background: rgba(10,16,22,.78); border: 1px solid rgba(255,210,63,.6); padding: 7px 16px; border-radius: 16px; margin-top: 6px; font-size: 15px; display: inline-block; }
-  /* Screens */
-  .screen { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 20px; }
-  #title-screen { background: linear-gradient(180deg, rgba(16,32,48,.25) 0%, rgba(16,24,32,.55) 55%, rgba(10,14,20,.88) 100%); }
-  #title-screen h1 { font-size: 72px; margin: 0; letter-spacing: 6px; color: #ffd23f; text-shadow: 0 4px 0 #c25e3a, 0 8px 24px rgba(0,0,0,.7); }
-  #title-screen h2 { font-size: 22px; margin: 6px 0 4px; font-weight: 600; color: #fff; letter-spacing: 2px; }
-  #title-screen p.tag { font-size: 16px; max-width: 560px; opacity: .95; margin: 8px 0 20px; line-height: 1.5; }
-  .screen h1.small { font-size: 52px; margin: 0 0 10px; letter-spacing: 4px; }
-  .screen p.detail { font-size: 17px; max-width: 520px; line-height: 1.5; }
-  #pause-screen, #busted-screen, #wasted-screen, #complete-screen { background: rgba(8, 12, 18, .72); }
-  #busted-screen h1 { color: #6db3ff; }
-  #wasted-screen h1 { color: #ff5a4e; }
-  #complete-screen h1 { color: #7dff9a; }
-  .btn { pointer-events: auto; cursor: pointer; font-size: 18px; font-weight: 700; padding: 12px 34px; margin: 6px; border: none; border-radius: 24px; background: #ffd23f; color: #231a05; box-shadow: 0 4px 0 #b98f12; }
-  .btn:hover { background: #ffe27a; }
-  .btn.secondary { background: rgba(255,255,255,.16); color: #fff; box-shadow: 0 4px 0 rgba(0,0,0,.4); border: 1px solid rgba(255,255,255,.5); }
-  .btn:disabled { opacity: .45; cursor: default; }
-  #save-info { font-size: 14px; opacity: .9; margin-top: 10px; }
-  #controls-line { font-size: 13px; opacity: .85; margin-top: 14px; max-width: 640px; line-height: 1.5; }
-  #webgl-fallback { position: fixed; inset: auto 0 0 0; z-index: 20; background: #7a1f1f; padding: 10px; text-align: center; font-size: 14px; }
-  #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
-</style>
+<meta name="color-scheme" content="dark">
+<title>Solmar Heat — Open-World Crime in Solmar Bay</title>
+<link rel="stylesheet" href="style.css">
+<script type="module" src="src/main.js"></script>
 </head>
 <body>
-<canvas id="game" aria-label="Solara Bay: an open-world crime game. Drive, explore, and complete six missions."></canvas>
-<p id="status" role="status" aria-live="polite"></p>
+<canvas id="game-canvas" width="1280" height="800"></canvas>
 
 <div id="hud" class="hidden">
   <div id="hud-top-left">
-    <div id="cash">$0</div>
-    <div id="health-bar"><div id="health-fill"></div></div>
-    <div id="health-text">100 HP</div>
-    <div id="stars" class="stars">☆☆☆☆☆</div>
-    <div id="ammo-line"><span id="weapon">Fists [1]</span> · <span id="ammo">Fists</span></div>
-    <div id="coins">☀ 0 / 30</div>
+    <div id="cash-display">$0</div>
+    <div id="health-row"><span id="health-label">HEALTH</span><div id="health-bar"><div id="health-fill"></div></div></div>
+    <div id="ammo-row"><span id="weapon-label">FISTS</span><span id="ammo-display"></span></div>
+    <div id="collectible-row"><span id="collectible-label">SUN COINS</span><span id="collectible-display">0 / 20</span></div>
   </div>
-  <div id="mission-box">
-    <div id="mission-title">Mission 1/6</div>
-    <div id="objective"></div>
+  <div id="wanted-stars" aria-label="Wanted level"></div>
+  <div id="mission-panel">
+    <div id="mission-title">FREE ROAM</div>
+    <div id="mission-objective">Explore Solmar Bay.</div>
+    <div id="mission-distance"></div>
   </div>
-  <div id="district"></div>
-  <div id="minimap-wrap"><canvas id="minimap" width="180" height="180"></canvas></div>
-  <div id="speed"></div>
-  <div id="hint">WASD move/drive · Drag mouse to look · Click punch/shoot · F car · E interact · 1/2 weapon · R reload · P pause</div>
-  <div id="toasts"></div>
+  <canvas id="minimap-canvas" width="220" height="220" aria-label="Minimap of Solmar Bay"></canvas>
+  <div id="speed-display" class="hidden">0 mph</div>
+  <div id="message-toast" class="hidden"></div>
+  <div id="controls-hint">WASD move/drive · E enter/exit car · F punch · Click shoot · Q camera · P pause · M mute · H horn</div>
+  <div id="interaction-prompt" class="hidden"></div>
 </div>
 
-<div id="title-screen" class="screen">
-  <h1>SOLARA BAY</h1>
-  <h2>THE SOLARA JOB</h2>
-  <p class="tag">A sun-soaked city of gold coupes, crooked deals and fast getaways. Six missions. Thirty Sun Coins. One last score — with Dario Voss and Mara Quinn.</p>
-  <div>
-    <button id="btn-start" class="btn">▶ New Game</button>
-    <button id="btn-continue" class="btn secondary">Continue</button>
-  </div>
-  <div id="save-info">No saved game yet.</div>
-  <div id="controls-line"></div>
-</div>
-
-<div id="pause-screen" class="screen hidden">
-  <h1 class="small">PAUSED</h1>
-  <p class="detail">Solara Bay is waiting. The heat does not cool down while you rest.</p>
-  <div>
-    <button id="btn-resume" class="btn">Resume</button>
-    <button id="btn-restart" class="btn secondary">Back to Title</button>
+<div id="title-screen" class="overlay">
+  <div class="panel title-panel">
+    <div id="title-kicker">SOLMAR BAY · A ONE-DEBT STORY</div>
+    <h1 id="game-title">SOLMAR HEAT</h1>
+    <p id="title-story">Mara Voss drove one job too many for fixer Ilsa Marek. Now the debt is due, the whole bay is watching, and six jobs stand between Mara and a clean slate.</p>
+    <div id="title-stats"></div>
+    <button id="start-button" class="menu-button">START ENGINE</button>
+    <button id="continue-button" class="menu-button hidden">CONTINUE — SAVED GAME</button>
+    <button id="help-button" class="menu-button">HOW TO PLAY</button>
+    <p id="title-footnote">Original game · keyboard + mouse · your progress saves automatically</p>
   </div>
 </div>
 
-<div id="busted-screen" class="screen hidden">
-  <h1 class="small">BUSTED</h1>
-  <p class="detail" id="busted-detail">The cops hauled you in.</p>
-  <div><button id="btn-busted" class="btn">Pay Bail &amp; Walk Free</button></div>
-</div>
-
-<div id="wasted-screen" class="screen hidden">
-  <h1 class="small">WASTED</h1>
-  <p class="detail">Mara patched you up at the diner. You wake up sore, broke in spirit only — the job goes on.</p>
-  <div><button id="btn-wasted" class="btn">Get Patched Up</button></div>
-</div>
-
-<div id="complete-screen" class="screen hidden">
-  <h1 class="small">JOB COMPLETE</h1>
-  <p class="detail" id="complete-detail"></p>
-  <div>
-    <button id="btn-again" class="btn">Play Again</button>
-    <button id="btn-title" class="btn secondary">Back to Title</button>
+<div id="help-screen" class="overlay hidden">
+  <div class="panel">
+    <h2>HOW TO PLAY</h2>
+    <ul id="help-list">
+      <li><b>W A S D</b> — walk / drive &nbsp; <b>Shift</b> — sprint &nbsp; <b>Q / E-drag</b> — camera</li>
+      <li><b>E</b> — steal / enter / exit a car &nbsp; <b>F</b> — punch &nbsp; <b>Click / J</b> — shoot</li>
+      <li><b>1 / 2</b> — fists / pistol &nbsp; <b>R</b> — reload &nbsp; <b>H</b> — horn &nbsp; <b>M</b> — mute</li>
+      <li><b>P / Esc</b> — pause &nbsp; Follow the gold beacon and the minimap marker for each job.</li>
+      <li>Stars mean the Solmar Bay police are hunting you. Break line of sight to cool off.</li>
+      <li>Grab the 20 gold sun coins hidden around the city — each pays $25.</li>
+    </ul>
+    <button id="help-close-button" class="menu-button">BACK</button>
   </div>
 </div>
 
-<div id="webgl-fallback" class="hidden">WebGL is not available in this browser, so the 3D city cannot be drawn. Try desktop Chrome with hardware acceleration enabled.</div>
+<div id="pause-screen" class="overlay hidden">
+  <div class="panel">
+    <h2>PAUSED</h2>
+    <p id="pause-summary"></p>
+    <button id="resume-button" class="menu-button">RESUME</button>
+    <button id="pause-help-button" class="menu-button">HOW TO PLAY</button>
+    <button id="restart-button" class="menu-button">RESTART FROM SAVE</button>
+    <button id="quit-button" class="menu-button">QUIT TO TITLE</button>
+  </div>
+</div>
 
-<script type="module" src="./src/main.js"></script>
+<div id="busted-screen" class="overlay hidden">
+  <div class="panel">
+    <h2 id="busted-heading">BUSTED</h2>
+    <p id="busted-text">The Solmar Bay police hauled Mara in. Bail took its cut.</p>
+    <button id="busted-button" class="menu-button">WALK FREE</button>
+  </div>
+</div>
+
+<div id="wasted-screen" class="overlay hidden">
+  <div class="panel">
+    <h2 id="wasted-heading">WASTED</h2>
+    <p id="wasted-text">Mara woke up at the Marina clinic, lighter in the pocket.</p>
+    <button id="wasted-button" class="menu-button">GET UP</button>
+  </div>
+</div>
+
+<div id="mission-screen" class="overlay hidden">
+  <div class="panel">
+    <div id="mission-complete-kicker">JOB COMPLETE</div>
+    <h2 id="mission-complete-title"></h2>
+    <p id="mission-complete-text"></p>
+    <div id="mission-complete-reward"></div>
+    <button id="mission-continue-button" class="menu-button">BACK TO THE BAY</button>
+  </div>
+</div>
+
+<div id="story-screen" class="overlay hidden">
+  <div class="panel">
+    <div id="story-complete-kicker">DEBT PAID</div>
+    <h2>SOLMAR HEAT — STORY COMPLETE</h2>
+    <p id="story-complete-text">Six jobs, one clean slate. Solmar Bay is Mara's again — free roam continues, and every sun coin still pays.</p>
+    <button id="story-continue-button" class="menu-button">KEEP DRIVING</button>
+  </div>
+</div>
+
+<div id="context-lost-screen" class="overlay hidden">
+  <div class="panel">
+    <h2>GRAPHICS PAUSED</h2>
+    <p>The browser took the graphics context away. It usually comes back on its own — the game will resume by itself.</p>
+  </div>
+</div>
+
+<div id="no-webgl-screen" class="overlay hidden">
+  <div class="panel">
+    <h2>WEBGL NEEDED</h2>
+    <p>Solmar Heat needs WebGL to draw its city. Please open it in a desktop browser with WebGL turned on.</p>
+  </div>
+</div>
 </body>
 </html>
