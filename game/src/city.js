@@ -1,206 +1,166 @@
-// buildCity: the whole 3D city of Solara Bay — ground, district tints, roads,
-// procedural buildings (with window textures drawn on a canvas, no files),
-// street lamps, Marina palms and pier, Harbor containers, coins and pickups.
-// Every solid building registers an AABB collider in g.colliders.
-import * as THREE from '../vendor/three.min.js';
-import { WORLD, ROADS, ROAD_HALF, DISTRICTS, SPAWN, MARKER_1, COIN_COUNT, districtAt, makeRng, dist2d } from './config.js';
+// Solara Bay — the city itself. A seeded, deterministic grid: streets every
+// 40 units, five districts with their own building heights and palettes, a
+// Marina waterfront to the west, palms, lamps, billboards and clouds. Builds
+// one static Mesh (drawn in a single call) plus the collision boxes, the
+// traffic loops, the Sun Coin spots and the pickup spots the game uses.
+import { CFG, DISTRICTS, COIN_SPOTS, PICKUP_SPOTS } from './config.js';
+import { mulberry32 } from './math3d.js';
+import { newTriList, pushBox, pushFlat } from './engine.js';
 
-function windowTexture(base, lit) {
-  const c = document.createElement('canvas');
-  c.width = 64; c.height = 128;
-  const ctx = c.getContext('2d');
-  ctx.fillStyle = base; ctx.fillRect(0, 0, 64, 128);
-  for (let y = 6; y < 122; y += 12) {
-    for (let x = 6; x < 58; x += 12) {
-      ctx.fillStyle = Math.random() < 0.45 ? lit : '#1c2733';
-      ctx.fillRect(x, y, 7, 8);
-    }
-  }
-  const tex = new THREE.CanvasTexture(c);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  return tex;
+function shade(rgb, f) { return [rgb[0] * f, rgb[1] * f, rgb[2] * f]; }
+function jitter(rng, rgb, amt) {
+  const f = 1 - amt / 2 + rng() * amt;
+  return [rgb[0] * f, rgb[1] * f, rgb[2] * f];
 }
 
-// Push a circle (x,z,r) out of every AABB collider it overlaps. Returns true if it hit.
-export function resolveCircle(g, p, r) {
-  let hit = false;
-  for (const c of g.colliders) {
-    const cx = Math.max(c.minX, Math.min(p.x, c.maxX));
-    const cz = Math.max(c.minZ, Math.min(p.z, c.maxZ));
-    const dx = p.x - cx, dz = p.z - cz;
+export function buildCity(renderer) {
+  const rng = mulberry32(7); // fixed seed: the same city on every load
+  const list = newTriList();
+  const colliders = []; // {x0,z0,x1,z1} building footprints, for collision
+  const H = CFG.worldHalf;
+
+  // Ground: grass-green base, then the beach and the sea west of the Marina.
+  pushFlat(list, 0, 0, H * 2 + 160, H * 2 + 160, -0.05, [0.42, 0.62, 0.35]);
+  pushFlat(list, -H - 30, 0, 60, H * 2 + 160, 0.0, [0.93, 0.82, 0.6]); // sand
+  pushFlat(list, -H - 90, 0, 120, H * 2 + 160, 0.02, [0.15, 0.45, 0.65]); // sea
+  // Distant skyline silhouettes outside the playable area, for depth.
+  for (let i = 0; i < 26; i++) {
+    const ang = (i / 26) * Math.PI * 2;
+    const r = 300 + rng() * 90;
+    const bx = Math.cos(ang) * r, bz = Math.sin(ang) * r;
+    if (bx < -H - 20) continue; // keep the sea horizon clean
+    const h = 25 + rng() * 55;
+    pushBox(list, bx, h / 2 - 1, bz, 22 + rng() * 18, h, 22 + rng() * 18,
+      shade([0.55, 0.5, 0.55], 0.8 + rng() * 0.3));
+  }
+  // A few flat white clouds drifting high above the city.
+  for (let i = 0; i < 9; i++) {
+    const cx = -180 + rng() * 360, cz = -180 + rng() * 360, cy = 70 + rng() * 25;
+    pushBox(list, cx, cy, cz, 26 + rng() * 22, 3, 10 + rng() * 8, [0.98, 0.97, 0.95]);
+  }
+  // The low sun disc, west over the sea.
+  pushBox(list, -260, 55, -60, 26, 26, 1, [1.0, 0.85, 0.45], [1.0, 0.9, 0.55]);
+
+  // Streets: asphalt strips on every grid line, sidewalks beside them.
+  const lines = [];
+  for (let v = -160; v <= 160; v += CFG.streetGap) lines.push(v);
+  for (const v of lines) {
+    pushFlat(list, v, 0, CFG.streetHalfWidth * 2, H * 2, 0.03, [0.28, 0.28, 0.3]);
+    pushFlat(list, 0, v, H * 2, CFG.streetHalfWidth * 2, 0.03, [0.28, 0.28, 0.3]);
+    pushFlat(list, v, 0, CFG.streetHalfWidth * 2 + 7, H * 2, 0.02, [0.68, 0.66, 0.62]);
+    pushFlat(list, 0, v, H * 2, CFG.streetHalfWidth * 2 + 7, 0.02, [0.68, 0.66, 0.62]);
+    // Centre dashes down each street.
+    for (let d = -180; d <= 180; d += 16) {
+      pushFlat(list, v, d, 0.7, 3.5, 0.05, [0.9, 0.85, 0.4]);
+      pushFlat(list, d, v, 3.5, 0.7, 0.05, [0.9, 0.85, 0.4]);
+    }
+  }
+  // City square plaza at the centre, with a fountain block off to one side
+  // so the plaza's middle stays clear for mission drop-offs.
+  pushFlat(list, 0, 0, 30, 30, 0.04, [0.78, 0.72, 0.62]);
+  pushBox(list, -10, 1.2, -10, 8, 2.4, 8, [0.3, 0.55, 0.75], [0.55, 0.8, 0.95]);
+
+  // Buildings, one or two per block. Blocks sit BETWEEN streets, so block
+  // centres are offset 20 from the street lines and never overlap a road.
+  const palettes = {
+    tall: [[0.72, 0.68, 0.75], [0.55, 0.62, 0.72], [0.8, 0.72, 0.6], [0.6, 0.66, 0.6]],
+    mid: [[0.85, 0.66, 0.48], [0.78, 0.6, 0.55], [0.7, 0.62, 0.5], [0.62, 0.68, 0.62]],
+    low: [[0.95, 0.85, 0.68], [0.9, 0.75, 0.6], [0.85, 0.8, 0.7], [0.75, 0.82, 0.85]],
+    houses: [[0.9, 0.7, 0.55], [0.85, 0.6, 0.5], [0.7, 0.75, 0.6], [0.8, 0.72, 0.6]],
+  };
+  for (let bx = -160; bx < 180; bx += CFG.streetGap) {
+    for (let bz = -160; bz < 180; bz += CFG.streetGap) {
+      const cx = bx + 20, cz = bz + 20;
+      if (Math.abs(cx) < 22 && Math.abs(cz) < 22) continue; // keep the square clear
+      const district = DISTRICTS.find((d) => d.test(cx, cz)) || DISTRICTS[1];
+      const pal = palettes[district.skyline] || palettes.mid;
+      const count = district.skyline === 'tall' ? 2 : 1;
+      for (let k = 0; k < count; k++) {
+        const ox = count === 1 ? 0 : (k === 0 ? -8 : 8);
+        const oz = count === 1 ? 0 : (k === 0 ? -8 : 8);
+        const w = 12 + rng() * 8, d = 12 + rng() * 8;
+        let h;
+        if (district.skyline === 'tall') h = 22 + rng() * 26;
+        else if (district.skyline === 'houses') h = 4 + rng() * 4;
+        else if (district.skyline === 'low') h = 6 + rng() * 7;
+        else h = 9 + rng() * 12;
+        const col = jitter(rng, pal[Math.floor(rng() * pal.length)], 0.25);
+        const top = shade(col, 1.25);
+        pushBox(list, cx + ox, h / 2, cz + oz, w, h, d, col, top);
+        // Rooftop box and a window band so tall buildings read as towers.
+        pushBox(list, cx + ox, h + 0.8, cz + oz, w * 0.35, 1.6, d * 0.35, shade(col, 0.7));
+        if (h > 12) {
+          pushBox(list, cx + ox, h * 0.62, cz + oz + d / 2 + 0.15, w * 0.8, h * 0.3, 0.3,
+            shade(col, 0.55));
+          pushBox(list, cx + ox + w / 2 + 0.15, h * 0.62, cz + oz, 0.3, h * 0.3, d * 0.8,
+            shade(col, 0.6));
+        }
+        colliders.push({ x0: cx + ox - w / 2, z0: cz + oz - d / 2, x1: cx + ox + w / 2, z1: cz + oz + d / 2 });
+      }
+    }
+  }
+
+  // Palms along the Marina boardwalk, lamps along the main streets.
+  for (let z = -180; z <= 180; z += 20) {
+    pushBox(list, -192, 3, z, 0.8, 6, 0.8, [0.45, 0.32, 0.2]);
+    pushBox(list, -192, 6.8, z, 5, 2.2, 5, [0.25, 0.55, 0.3], [0.4, 0.7, 0.35]);
+  }
+  // Lamps sit on sidewalk corners (offset from both street lines) so they
+  // never stand in a driving lane.
+  for (let v = -160; v <= 160; v += 80) {
+    for (let d = -160; d <= 160; d += 40) {
+      pushBox(list, v + 7, 2.5, d + 7, 0.4, 5, 0.4, [0.2, 0.2, 0.22]);
+      pushBox(list, v + 7, 5.2, d + 7, 1.6, 0.7, 1.6, [1.0, 0.9, 0.55], [1.0, 0.95, 0.7]);
+      pushBox(list, d + 7, 2.5, v + 7, 0.4, 5, 0.4, [0.2, 0.2, 0.22]);
+      pushBox(list, d + 7, 5.2, v + 7, 1.6, 0.7, 1.6, [1.0, 0.9, 0.55], [1.0, 0.95, 0.7]);
+    }
+  }
+  // Downtown billboards on tall poles.
+  const ads = [[0.95, 0.3, 0.35], [0.2, 0.6, 0.9], [0.95, 0.75, 0.2]];
+  [[-40, -40], [40, 40], [0, -80]].forEach(([x, z], i) => {
+    pushBox(list, x, 6, z, 1, 12, 1, [0.25, 0.25, 0.28]);
+    pushBox(list, x, 14, z, 14, 7, 0.6, ads[i % 3], ads[i % 3]);
+  });
+
+  const mesh = renderer.makeMesh(list);
+
+  // Traffic loops: rectangles around blocks, driven on street centrelines.
+  const loops = [];
+  for (let bx = -160; bx <= 120; bx += 80) {
+    for (let bz = -160; bz <= 120; bz += 80) {
+      loops.push([
+        [bx, bz], [bx + 80, bz], [bx + 80, bz + 80], [bx, bz + 80],
+      ]);
+    }
+  }
+  // Sun Coins and pickups, as placed in config.
+  const coins = COIN_SPOTS.slice(0, CFG.coinCount).map(([x, z]) => ({ x, z, taken: false, spin: Math.random() * 6 }));
+  const pickups = PICKUP_SPOTS.map((p) => ({ ...p, x: p.pos[0], z: p.pos[1], active: true, timer: 0 }));
+  return { mesh, colliders, loops, coins, pickups };
+}
+
+// Circle (player / car) vs building AABB: push the circle out, return the
+// corrected position. Used for both on-foot and driving collision.
+export function collideCircleBox(x, z, r, colliders) {
+  let nx = x, nz = z;
+  for (const b of colliders) {
+    const cx = Math.max(b.x0, Math.min(nx, b.x1));
+    const cz = Math.max(b.z0, Math.min(nz, b.z1));
+    const dx = nx - cx, dz = nz - cz;
     const d2 = dx * dx + dz * dz;
-    if (d2 >= r * r) continue;
-    hit = true;
-    if (d2 > 1e-6) {
+    if (d2 < r * r && d2 > 0.0001) {
       const d = Math.sqrt(d2);
-      p.x = cx + (dx / d) * r; p.z = cz + (dz / d) * r;
-    } else {
+      nx = cx + (dx / d) * r; nz = cz + (dz / d) * r;
+    } else if (d2 <= 0.0001) {
       // Centre inside the box: push out along the smallest penetration axis.
-      const pl = Math.min(p.x - c.minX, c.maxX - p.x);
-      const pz = Math.min(p.z - c.minZ, c.maxZ - p.z);
-      if (pl < pz) p.x = p.x - c.minX < c.maxX - p.x ? c.minX - r : c.maxX + r;
-      else p.z = p.z - c.minZ < c.maxZ - p.z ? c.minZ - r : c.maxZ + r;
+      const pl = nx - b.x0, pr = b.x1 - nx, pt = nz - b.z0, pb = b.z1 - nz;
+      const m = Math.min(pl, pr, pt, pb);
+      if (m === pl) nx = b.x0 - r; else if (m === pr) nx = b.x1 + r;
+      else if (m === pt) nz = b.z0 - r; else nz = b.z1 + r;
     }
   }
-  p.x = Math.max(-WORLD.bound, Math.min(WORLD.bound, p.x));
-  p.z = Math.max(-WORLD.bound, Math.min(WORLD.bound, p.z));
-  return hit;
+  return [nx, nz];
 }
-
-export function isOnRoad(x, z) {
-  for (const r of ROADS) if (Math.abs(x - r) < ROAD_HALF + 1 || Math.abs(z - r) < ROAD_HALF + 1) return true;
-  return false;
-}
-
-function box(w, h, d, color, x, y, z) {
-  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), new THREE.MeshLambertMaterial({ color }));
-  m.position.set(x, y, z);
-  return m;
-}
-
-export function buildCity(g) {
-  const rng = makeRng(g.seed);
-  const scene = g.scene;
-  g.colliders = [];
-  g.coins = [];
-  g.pickups = [];
-
-  scene.background = new THREE.Color(0x87b5d9);
-  scene.fog = new THREE.Fog(0x9fc3dd, 120, 420);
-  const hemi = new THREE.HemisphereLight(0xcfe8ff, 0x5a6b52, 0.95);
-  scene.add(hemi);
-  const sun = new THREE.DirectionalLight(0xffe6b0, 1.6);
-  sun.position.set(120, 180, 60);
-  scene.add(sun);
-  const sunBall = new THREE.Mesh(new THREE.SphereGeometry(9, 16, 16), new THREE.MeshBasicMaterial({ color: 0xfff2c0 }));
-  sunBall.position.set(180, 150, -260);
-  scene.add(sunBall);
-
-  // Base ground + one tinted slab per district.
-  const ground = new THREE.Mesh(new THREE.PlaneGeometry(320, 320), new THREE.MeshLambertMaterial({ color: 0x6f7f66 }));
-  ground.rotation.x = -Math.PI / 2; ground.position.y = -0.05;
-  scene.add(ground);
-  for (const d of DISTRICTS) {
-    const slab = new THREE.Mesh(new THREE.PlaneGeometry(d.x1 - d.x0, d.z1 - d.z0), new THREE.MeshLambertMaterial({ color: d.ground }));
-    slab.rotation.x = -Math.PI / 2;
-    slab.position.set((d.x0 + d.x1) / 2, 0, (d.z0 + d.z1) / 2);
-    scene.add(slab);
-  }
-  // Roads: dark strips along every grid line.
-  const roadMat = new THREE.MeshLambertMaterial({ color: 0x2e3138 });
-  for (const r of ROADS) {
-    for (const horiz of [true, false]) {
-      const road = new THREE.Mesh(new THREE.PlaneGeometry(320, ROAD_HALF * 2), roadMat);
-      road.rotation.x = -Math.PI / 2;
-      road.rotation.z = horiz ? 0 : Math.PI / 2;
-      road.position.set(horiz ? 0 : r, 0.02, horiz ? r : 0);
-      scene.add(road);
-    }
-  }
-  // Centre dashes.
-  const dashMat = new THREE.MeshBasicMaterial({ color: 0xd8c95a });
-  for (const r of ROADS) {
-    for (let t = -140; t < 140; t += 12) {
-      const dash = new THREE.Mesh(new THREE.PlaneGeometry(5, 0.5), dashMat);
-      dash.rotation.x = -Math.PI / 2;
-      dash.position.set(t, 0.04, r);
-      scene.add(dash);
-    }
-  }
-
-  // Buildings: one per block cell, skipped on roads and kept clear of the
-  // spawn point and the first mission marker (spawn-bug fix by design).
-  const texCache = new Map();
-  const texFor = (d) => {
-    if (!texCache.has(d.name)) {
-      const hex = '#' + d.color.toString(16).padStart(6, '0');
-      texCache.set(d.name, windowTexture(hex, d.tall ? '#ffe9a8' : '#9fd8ff'));
-    }
-    return texCache.get(d.name);
-  };
-  for (let bx = -135; bx <= 135; bx += 30) {
-    for (let bz = -135; bz <= 135; bz += 30) {
-      const cx = bx + 15, cz = bz + 15;
-      if (isOnRoad(cx, cz)) continue;
-      if (dist2d(cx, cz, SPAWN.x, SPAWN.z) < 26) continue;
-      if (dist2d(cx, cz, MARKER_1.x, MARKER_1.z) < 14) continue;
-      if (rng() < 0.18) continue; // empty lots / plazas
-      const d = districtAt(cx, cz);
-      const w = 12 + rng() * 8, dep = 12 + rng() * 8;
-      const h = d.hMin + rng() * (d.hMax - d.hMin);
-      const mat = new THREE.MeshLambertMaterial({ map: texFor(d) });
-      const b = new THREE.Mesh(new THREE.BoxGeometry(w, h, dep), mat);
-      b.position.set(cx, h / 2, cz);
-      scene.add(b);
-      // Roof trim.
-      const roof = box(w + 0.6, 0.5, dep + 0.6, 0x3a3f47, cx, h + 0.25, cz);
-      scene.add(roof);
-      g.colliders.push({ minX: cx - w / 2, maxX: cx + w / 2, minZ: cz - dep / 2, maxZ: cz + dep / 2 });
-      g.buildingBoxes.push({ x: cx, z: cz, w, d: dep });
-    }
-  }
-
-  // Marina pier: wooden deck + posts out over the water edge at z=-146.
-  const pierMat = new THREE.MeshLambertMaterial({ color: 0x8a6b45 });
-  const pier = new THREE.Mesh(new THREE.BoxGeometry(30, 1, 10), pierMat);
-  pier.position.set(24, 0.5, -142);
-  scene.add(pier);
-  for (let x = 12; x <= 36; x += 6) {
-    const post = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.4, 3, 6), pierMat);
-    post.position.set(x, -0.5, -146);
-    scene.add(post);
-  }
-  // Marina palms.
-  const palmTrunk = new THREE.MeshLambertMaterial({ color: 0x7a5a38 });
-  const palmLeaf = new THREE.MeshLambertMaterial({ color: 0x2f8f4e });
-  for (let i = 0; i < 16; i++) {
-    const x = -130 + rng() * 260, z = -138 + rng() * 30;
-    if (isOnRoad(x, z)) continue;
-    const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.5, 7, 6), palmTrunk);
-    trunk.position.set(x, 3.5, z); scene.add(trunk);
-    const top = new THREE.Mesh(new THREE.SphereGeometry(2.2, 8, 6), palmLeaf);
-    top.position.set(x, 7.4, z); top.scale.y = 0.5; scene.add(top);
-  }
-  // Harbor containers.
-  const contColors = [0xc65a3a, 0x3a7ac6, 0x4a9e5a, 0xc6a03a];
-  for (let i = 0; i < 18; i++) {
-    const x = 78 + rng() * 58, z = -70 + rng() * 110;
-    if (isOnRoad(x, z)) continue;
-    const c = box(9, 3, 3.4, contColors[i % 4], x, 1.5, z);
-    c.rotation.y = (i % 2) * Math.PI / 2;
-    scene.add(c);
-    g.colliders.push({ minX: x - 4.5, maxX: x + 4.5, minZ: z - 1.8, maxZ: z + 1.8 });
-  }
-  // Street lamps along the main roads.
-  const poleMat = new THREE.MeshLambertMaterial({ color: 0x22262c });
-  const lampMat = new THREE.MeshBasicMaterial({ color: 0xfff6c0 });
-  for (const r of [-60, 0, 60]) {
-    for (let t = -120; t <= 120; t += 40) {
-      const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.15, 0.2, 7, 6), poleMat);
-      pole.position.set(r + 6, 3.5, t); scene.add(pole);
-      const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.6, 8, 8), lampMat);
-      lamp.position.set(r + 6, 7.1, t); scene.add(lamp);
-    }
-  }
-
-  // Sun Coins: 30 gold spinners spread across the districts, clear of roads' centres.
-  const coinGeo = new THREE.CylinderGeometry(0.9, 0.9, 0.18, 20);
-  const coinMat = new THREE.MeshLambertMaterial({ color: 0xffc93e, emissive: 0x8a6d00 });
-  for (let i = 0; i < COIN_COUNT; i++) {
-    const x = -138 + rng() * 276, z = -138 + rng() * 276;
-    const mesh = new THREE.Mesh(coinGeo, coinMat);
-    mesh.rotation.x = Math.PI / 2;
-    mesh.position.set(x, 1.2, z);
-    scene.add(mesh);
-    g.coins.push({ mesh, x, z, taken: false, spin: rng() * 6 });
-  }
-  // Health (green cross) and armour (blue) pickups.
-  const mkPickup = (x, z, color, kind) => {
-    const mesh = box(1.6, 1.6, 1.6, color, x, 1, z);
-    const cap = box(1.9, 0.4, 1.9, 0xffffff, x, 2, z);
-    scene.add(mesh); scene.add(cap);
-    g.pickups.push({ mesh, cap, x, z, kind, taken: false });
-  };
-  const spots = [[-40, -100], [40, -40], [-100, 20], [100, -40], [0, 100], [-80, 110], [80, 80], [-20, -60], [60, 120], [-120, -40]];
-  spots.forEach(([x, z], i) => mkPickup(x, z, i % 2 ? 0x2f7de1 : 0x2fd67a, i % 2 ? 'armour' : 'health'));
+export function pointInBox(x, z, b, pad) {
+  return x > b.x0 - pad && x < b.x1 + pad && z > b.z0 - pad && z < b.z1 + pad;
 }
